@@ -50,10 +50,9 @@ jobs:
           generated="luci-app-tachyon/htdocs/luci-static/resources/view/tachyon/main.js"
           formatted_test="fe-app-tachyon/src/tachyon/tabs/updates/tests/releaseNotes.test.ts"
           git diff --check
-          unexpected="$(git diff --name-only | grep -v -E '^(luci-app-tachyon/htdocs/luci-static/resources/view/tachyon/main\.js|fe-app-tachyon/src/tachyon/tabs/updates/tests/releaseNotes\.test\.ts) || true)"
-          if [ -n "$unexpected" ]; then
+          if git diff --name-only | grep -Fvx "$generated" | grep -Fvx "$formatted_test" | grep -q .; then
             echo "Unexpected files changed during the frontend build:" >&2
-            printf '%s\n' "$unexpected" >&2
+            git diff --name-only >&2
             exit 1
           fi
           if git diff --quiet -- "$generated" "$formatted_test"; then
