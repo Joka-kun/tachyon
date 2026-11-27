@@ -1,0 +1,56 @@
+name: Build release-notes LuCI asset
+
+on:
+  push:
+    branches:
+      - qualification/release-notes-asset-build
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the PR source branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/release-notes-selected-tag
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: fe-app-tachyon/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: fe-app-tachyon
+        run: npm ci
+
+      - name: Run frontend tests
+        working-directory: fe-app-tachyon
+        run: npm run test -- --run
+
+      - name: Build frontend and generated LuCI views
+        working-directory: fe-app-tachyon
+        run: npm run build
+
+      - name: Commit only the generated LuCI main.js to the PR branch
+        env:
+          TARGET_BRANCH: codex/release-notes-selected-tag
+        run: |
+          set -euo pipefail
+          generated="luci-app-tachyon/htdocs/luci-static/resources/view/tachyon/main.js"
+          git diff --check
+          if git diff --quiet -- "$generated"; then
+            echo "Generated LuCI main.js is already up to date."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "$generated"
+          git commit -m "build(frontend): refresh generated LuCI view"
+          git push origin "HEAD:refs/heads/$TARGET_BRANCH"
