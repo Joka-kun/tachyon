@@ -30,6 +30,10 @@ jobs:
         working-directory: fe-app-tachyon
         run: npm ci
 
+      - name: Format frontend source
+        working-directory: fe-app-tachyon
+        run: npm run format
+
       - name: Run frontend tests
         working-directory: fe-app-tachyon
         run: npm run test -- --run
@@ -44,13 +48,20 @@ jobs:
         run: |
           set -euo pipefail
           generated="luci-app-tachyon/htdocs/luci-static/resources/view/tachyon/main.js"
+          formatted_test="fe-app-tachyon/src/tachyon/tabs/updates/tests/releaseNotes.test.ts"
           git diff --check
-          if git diff --quiet -- "$generated"; then
-            echo "Generated LuCI main.js is already up to date."
+          unexpected="$(git diff --name-only | grep -v -E '^(luci-app-tachyon/htdocs/luci-static/resources/view/tachyon/main\.js|fe-app-tachyon/src/tachyon/tabs/updates/tests/releaseNotes\.test\.ts) || true)"
+          if [ -n "$unexpected" ]; then
+            echo "Unexpected files changed during the frontend build:" >&2
+            printf '%s\n' "$unexpected" >&2
+            exit 1
+          fi
+          if git diff --quiet -- "$generated" "$formatted_test"; then
+            echo "Generated LuCI asset and frontend test formatting are already up to date."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -- "$generated"
-          git commit -m "build(frontend): refresh generated LuCI view"
+          git add -- "$generated" "$formatted_test"
+          git commit -m "build(frontend): refresh LuCI asset and format tests"
           git push origin "HEAD:refs/heads/$TARGET_BRANCH"
