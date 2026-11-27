@@ -35,6 +35,10 @@ jobs:
         working-directory: fe-app-tachyon
         run: npm run format
 
+      - name: Actualize locale catalogs
+        working-directory: fe-app-tachyon
+        run: npm run locales:actualize
+
       - name: Export formatter output for exact PR patch
         run: |
           echo "BEGIN_RELEASE_NOTES_TEST"
@@ -56,18 +60,27 @@ jobs:
           set -euo pipefail
           generated="luci-app-tachyon/htdocs/luci-static/resources/view/tachyon/main.js"
           formatted_test="fe-app-tachyon/src/tachyon/tabs/updates/tests/releaseNotes.test.ts"
+          locale_files=(
+            "fe-app-tachyon/locales/tachyon.pot"
+            "fe-app-tachyon/locales/tachyon.ru.po"
+            "luci-app-tachyon/po/ru/tachyon.po"
+            "luci-app-tachyon/po/templates/tachyon.pot"
+          )
           git diff --check
-          if git diff --name-only | grep -Fvx "$generated" | grep -Fvx "$formatted_test" | grep -q .; then
-            echo "Unexpected files changed during the frontend build:" >&2
-            git diff --name-only >&2
-            exit 1
-          fi
-          if git diff --quiet -- "$generated" "$formatted_test"; then
-            echo "Generated LuCI asset and frontend test formatting are already up to date."
+          allowed=("$generated" "$formatted_test" "${locale_files[@]}")
+          while IFS= read -r changed; do
+            [ -z "$changed" ] && continue
+            if [[ ! " ${allowed[*]} " == *" $changed "* ]]; then
+              echo "Unexpected file changed during frontend qualification: $changed" >&2
+              exit 1
+            fi
+          done < <(git diff --name-only)
+          if git diff --quiet -- "$generated" "$formatted_test" "${locale_files[@]}"; then
+            echo "Generated frontend asset, locale catalogs and test formatting are already up to date."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -- "$generated" "$formatted_test"
-          git commit -m "build(frontend): refresh LuCI asset and format tests"
+          git add -- "$generated" "$formatted_test" "${locale_files[@]}"
+          git commit -m "build(frontend): refresh LuCI asset and locale catalogs"
           git push origin "HEAD:refs/heads/$TARGET_BRANCH"
