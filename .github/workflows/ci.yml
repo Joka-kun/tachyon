@@ -148,8 +148,8 @@ jobs:
           python3 tools/test_entware_pkg.py
 
   native-release-rpc:
-    name: Native release RPC (\${{ matrix.arch }})
-    runs-on: \${{ matrix.os }}
+    name: Native release RPC (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
