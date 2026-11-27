@@ -146,3 +146,59 @@ jobs:
         run: |
           python3 -m py_compile tools/build_openwrt_pkg.py tools/build_entware_pkg.py
           python3 tools/test_entware_pkg.py
+
+  native-release-rpc:
+    name: Native release RPC (\${{ matrix.arch }})
+    runs-on: \${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+    steps:
+      - name: Checkout qualification branch
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Fetch and verify exact upstream PR base
+        env:
+          BASE_SHA: 9b11b305d152a8358feb9d910d7e87cd1a9239fe
+        run: |
+          set -euo pipefail
+          git fetch --no-tags https://github.com/Dushnilin/tachyon.git refs/heads/2.0:refs/remotes/upstream/2.0
+          test "$(git rev-parse refs/remotes/upstream/2.0)" = "$BASE_SHA"
+          git worktree add /tmp/tachyon-base "$BASE_SHA"
+
+      - name: Build baseline and candidate native binaries
+        run: |
+          set -euo pipefail
+          (cd /tmp/tachyon-base && cargo build --locked --release)
+          cargo build --locked --release
+          test -x /tmp/tachyon-base/target/release/tachyon
+          test -x "$GITHUB_WORKSPACE/target/release/tachyon"
+
+      - name: Run isolated differential RPC regression
+        run: |
+          set -euo pipefail
+          command -v sudo
+          command -v unshare
+          command -v setpriv
+          command -v ip
+          outer_net="$(readlink /proc/self/ns/net)"
+          outer_mnt="$(readlink /proc/self/ns/mnt)"
+          sudo unshare --net --mount -- bash -euo pipefail -c '
+            export OUTER_NET="$1" OUTER_MNT="$2"
+            ip link set lo up
+            mount --make-rprivate /
+            exec setpriv --reuid="$3" --regid="$4" --clear-groups \
+              python3 "$5" "$6" "$7"
+          ' bash "$outer_net" "$outer_mnt" "$(id -u)" "$(id -g)" \
+            "$GITHUB_WORKSPACE/tools/qualify_native_release_rpc.py" \
+            /tmp/tachyon-base/target/release/tachyon \
+            "$GITHUB_WORKSPACE/target/release/tachyon"
