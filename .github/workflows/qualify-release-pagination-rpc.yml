@@ -1,0 +1,61 @@
+name: Qualify native release catalog RPC
+on:
+  push:
+    branches:
+      - qualification/release-pagination-rpc-v525
+permissions:
+  contents: read
+jobs:
+  rpc:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      BASE: 131b486a32d6cc621598881bc8f61342a986a0a3
+      CANDIDATE: d8a4854ae6d1eefc41f701d48f54a099c2abfbf0
+      RUST_VERSION: 1.100.0
+    steps:
+      - name: Verify the exact previously qualified source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init -q source
+          git -C source fetch --no-tags --depth=3 "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_REF"
+          test "$(git -C source rev-parse FETCH_HEAD)" = "$GITHUB_SHA"
+          git -C source checkout --quiet --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD^)" = "$CANDIDATE"
+          test "$(git -C source rev-parse HEAD^^)" = "$BASE"
+          test "$(git -C source diff --name-only "$BASE" "$CANDIDATE")" = 'src/updater.rs'
+          test "$(git -C source rev-parse "$CANDIDATE:src/updater.rs")" = '8c5b70209a49a8e2f8d8c671eeb60c322910d4d9'
+          test "$(git -C source rev-parse "$BASE:src/updater.rs")" = '42ea43d3264d877203d58f06a3a34ac763e0933b'
+          test "$(git -C source diff --name-only HEAD^ HEAD)" = $'.github/workflows/qualify-release-pagination-rpc.yml\ntools/qualification/native-release-rpc.py'
+          cp source/tools/qualification/native-release-rpc.py "$RUNNER_TEMP/native-release-rpc.py"
+          git -C source checkout --quiet --detach "$CANDIDATE"
+      - name: Build candidate and unchanged upstream
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          CARGO_TARGET_DIR="$RUNNER_TEMP/candidate-build" cargo +"$RUST_VERSION" build --locked --bin tachyon
+          git checkout --quiet --detach "$BASE"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/baseline-build" cargo +"$RUST_VERSION" build --locked --bin tachyon
+          git checkout --quiet --detach "$CANDIDATE"
+          test -z "$(git status --porcelain --untracked-files=no)"
+      - name: Differential native RPC with isolated local DNS fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          outer=$(readlink /proc/self/ns/net)
+          run_uid=$(id -u)
+          run_gid=$(id -g)
+          sudo env OUTER_NET="$outer" RUN_UID="$run_uid" RUN_GID="$run_gid" RUNNER_TEMP="$RUNNER_TEMP" PATH="$PATH" unshare --net -- bash -c '
+            set -euo pipefail
+            ip link set lo up
+            exec setpriv --reuid="$RUN_UID" --regid="$RUN_GID" --clear-groups \
+              env OUTER_NET="$OUTER_NET" PATH="$PATH" RUNNER_TEMP="$RUNNER_TEMP" \
+              python3 "$RUNNER_TEMP/native-release-rpc.py" "$RUNNER_TEMP/baseline-build/debug/tachyon" "$RUNNER_TEMP/candidate-build/debug/tachyon"
+          '
