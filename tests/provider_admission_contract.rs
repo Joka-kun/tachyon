@@ -23,7 +23,10 @@ fn identity(
         || leaf.get("type")?.as_str()? != "vless"
         || leaf.contains_key("detour")
         || leaf.get("server")?.as_str()?.is_empty()
-        || leaf.get("server_port")?.as_u64().is_none_or(|p| p == 0 || p > 65535)
+        || leaf
+            .get("server_port")?
+            .as_u64()
+            .is_none_or(|p| p == 0 || p > 65535)
         || leaf.get("uuid")?.as_str()?.is_empty()
     {
         return None;
@@ -38,7 +41,9 @@ fn identity(
         "route_context": route_context,
         "outbound": leaf,
     });
-    Some(Identity(Sha256::digest(material.to_string().as_bytes()).into()))
+    Some(Identity(
+        Sha256::digest(material.to_string().as_bytes()).into(),
+    ))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -307,10 +312,16 @@ fn foreign_stale_future_or_unbound_observations_cannot_admit() {
 fn revision_and_clock_conflicts_fail_before_publication() {
     let mut a = attempt(&[], Fetch::Failed, &[]);
     a.current_revision = [2; 32];
-    assert!(matches!(reconcile(&State::default(), a), Err(GateError::RevisionChanged)));
+    assert!(matches!(
+        reconcile(&State::default(), a),
+        Err(GateError::RevisionChanged)
+    ));
     let mut a = attempt(&[], Fetch::Failed, &[]);
     a.max_age = 0;
-    assert!(matches!(reconcile(&State::default(), a), Err(GateError::InvalidClock)));
+    assert!(matches!(
+        reconcile(&State::default(), a),
+        Err(GateError::InvalidClock)
+    ));
 }
 
 #[test]
