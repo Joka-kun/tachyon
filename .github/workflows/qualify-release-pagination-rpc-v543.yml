@@ -11,7 +11,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
-    runs-on: \${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
     env:
       BASE: ba060231d301ddcf97a0caf7a0c1df2963d0c65f
@@ -25,8 +25,8 @@ jobs:
         run: |
           set -euo pipefail
           git init -q source
-          git -C source fetch --no-tags --depth=4 "https://github.com/\${GITHUB_REPOSITORY}.git" "\${GITHUB_REF}"
-          test "$(git -C source rev-parse FETCH_HEAD)" = "\${GITHUB_SHA}"
+          git -C source fetch --no-tags --depth=4 "https://github.com/${GITHUB_REPOSITORY}.git" "${GITHUB_REF}"
+          test "$(git -C source rev-parse FETCH_HEAD)" = "${GITHUB_SHA}"
           git -C source checkout --quiet --detach FETCH_HEAD
           test "$(git -C source rev-parse HEAD^)" = "$SCRIPT_COMMIT"
           test "$(git -C source rev-parse HEAD^^)" = "$CANDIDATE"
@@ -69,7 +69,5 @@ jobs:
           test "$(readlink /proc/self/ns/mnt)" != "$OUTER_MNT"
           test "$(stat -f -c %T /run)" = tmpfs
           test "$(stat -f -c %T /tmp)" = tmpfs
-          exec setpriv --reuid="$RUN_UID" --regid="$RUN_GID" --clear-groups \
-            env OUTER_NET="$OUTER_NET" OUTER_MNT="$OUTER_MNT" RUNNER_TEMP="$RUNNER_TEMP" PATH="$PATH" TMPDIR=/tmp \
-            python3 "$RUNNER_TEMP/native-release-rpc-dns.py" "$RUNNER_TEMP/baseline-build/debug/tachyon" "$RUNNER_TEMP/candidate-build/debug/tachyon"
+          exec setpriv --reuid="$RUN_UID" --regid="$RUN_GID" --clear-groups env OUTER_NET="$OUTER_NET" OUTER_MNT="$OUTER_MNT" RUNNER_TEMP="$RUNNER_TEMP" PATH="$PATH" TMPDIR=/tmp python3 "$RUNNER_TEMP/native-release-rpc-dns.py" "$RUNNER_TEMP/baseline-build/debug/tachyon" "$RUNNER_TEMP/candidate-build/debug/tachyon"
           NS
