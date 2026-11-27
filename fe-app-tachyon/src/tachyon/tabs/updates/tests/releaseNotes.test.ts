@@ -13,44 +13,98 @@ describe('release notes lookup', () => {
 
   const latest = { tag: 'v2.1', body: 'Latest changes' };
   const selected = { tag: 'v2.0', body: 'Earlier changes' };
+  const release = (tag: string) => ({ tag, body: `Notes for ${tag}` });
+  const page = (prefix: string, count = 30) =>
+    Array.from({ length: count }, (_, index) => release(`${prefix}-${index}`));
 
-  it('matches the requested tag and reuses its notes for the same component', async () => {
+  it('prefers an exact tag before the optional v-prefix fallback', async () => {
+    const { getReleaseForNotes } = await import('../releaseNotes');
+    const exact = release('v2.0');
+    const withoutPrefix = release('2.0');
+    listReleases.mockResolvedValueOnce({
+      success: true,
+      data: [latest, withoutPrefix, exact],
+    });
+
+    expect(await getReleaseForNotes('tachyon', 'v2.0')).toEqual(exact);
+    expect(listReleases).toHaveBeenCalledTimes(1);
+    expect(listReleases).toHaveBeenCalledWith('tachyon', 30, 1);
+  });
+
+  it('matches a selected tag on a later page', async () => {
+    const { getReleaseForNotes } = await import('../releaseNotes');
+    const secondPage = [selected];
+    listReleases
+      .mockResolvedValueOnce({ success: true, data: page('page-one') })
+      .mockResolvedValueOnce({ success: true, data: secondPage });
+
+    expect(await getReleaseForNotes('tachyon', '2.0')).toEqual(selected);
+    expect(listReleases.mock.calls).toEqual([
+      ['tachyon', 30, 1],
+      ['tachyon', 30, 2],
+    ]);
+  });
+
+  it('stops at the first empty page', async () => {
+    const { getReleaseForNotes } = await import('../releaseNotes');
+    listReleases
+      .mockResolvedValueOnce({ success: true, data: page('page-one') })
+      .mockResolvedValueOnce({ success: true, data: [] });
+
+    expect(await getReleaseForNotes('tachyon', 'missing-tag')).toBeUndefined();
+    expect(listReleases).toHaveBeenCalledTimes(2);
+  });
+
+  it('stops when the backend returns its undated local-build fallback', async () => {
     const { getReleaseForNotes } = await import('../releaseNotes');
     listReleases.mockResolvedValueOnce({
       success: true,
-      data: [latest, selected],
+      data: [{
+        tag: 'v2.0-local',
+        body: 'Local build',
+        published: '',
+        release_url: 'https://github.com/example/tachyon/releases',
+      }],
     });
-    expect(await getReleaseForNotes('tachyon', ' 2.0 ')).toEqual(selected);
-    expect(await getReleaseForNotes('tachyon', 'V2.0')).toEqual(selected);
-    expect(listReleases.mock.calls).toEqual([['tachyon', 10, 1]]);
+
+    expect(await getReleaseForNotes('tachyon', 'older-tag')).toBeUndefined();
+    expect(listReleases).toHaveBeenCalledTimes(1);
   });
 
-  it('only uses the first release when no version was supplied', async () => {
+  it('uses the first release when no version was supplied', async () => {
     const { getReleaseForNotes } = await import('../releaseNotes');
-    listReleases.mockResolvedValue({ success: true, data: [latest] });
-    expect(await getReleaseForNotes('tachyon', selected.tag)).toBeUndefined();
+    listReleases.mockResolvedValueOnce({ success: true, data: [latest] });
+
     expect(await getReleaseForNotes('tachyon', '')).toEqual(latest);
+    expect(listReleases).toHaveBeenCalledTimes(1);
   });
 
-  it('asks for the current latest release again after a channel change', async () => {
+  it('does not reuse stale latest results after a channel change', async () => {
     const { getReleaseForNotes } = await import('../releaseNotes');
     listReleases
       .mockResolvedValueOnce({ success: true, data: [selected] })
       .mockResolvedValueOnce({ success: true, data: [latest] });
+
     expect(await getReleaseForNotes('tachyon', '')).toEqual(selected);
     expect(await getReleaseForNotes('tachyon', '')).toEqual(latest);
+    expect(listReleases).toHaveBeenCalledTimes(2);
   });
 
-  it('keeps component caches independent and retries a failed lookup', async () => {
+  it('propagates a failed page lookup instead of showing unrelated notes', async () => {
     const { getReleaseForNotes } = await import('../releaseNotes');
-    listReleases
-      .mockResolvedValueOnce({ success: true, data: [latest] })
-      .mockResolvedValueOnce({ success: false, error: 'offline' })
-      .mockResolvedValueOnce({ success: true, data: [selected] });
-    await getReleaseForNotes('tachyon', '');
-    await expect(getReleaseForNotes('tachyon-core', '')).rejects.toThrow(
-      'offline',
-    );
-    expect(await getReleaseForNotes('tachyon-core', '')).toEqual(selected);
+    listReleases.mockResolvedValueOnce({ success: false, error: 'offline' });
+
+    await expect(getReleaseForNotes('tachyon', 'v2.0')).rejects.toThrow('offline');
+  });
+
+  it('stops at the bounded search limit for very old tags', async () => {
+    const { getReleaseForNotes } = await import('../releaseNotes');
+    listReleases.mockImplementation(async () => ({
+      success: true,
+      data: page('not-the-tag'),
+    }));
+
+    expect(await getReleaseForNotes('tachyon', 'older-than-search-window')).toBeUndefined();
+    expect(listReleases).toHaveBeenCalledTimes(10);
   });
 });
