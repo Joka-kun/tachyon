@@ -1,0 +1,75 @@
+name: Qualify release catalog pagination
+
+on:
+  push:
+    branches:
+      - qualification/release-pagination-v519
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    name: Native qualification (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    env:
+      UPSTREAM_COMMIT: 6211109a28fbabda3153e482cb00c1bb70dfcae8
+      UPDATER_BLOB: 42ea43d3264d877203d58f06a3a34ac763e0933b
+      RUST_VERSION: 1.100.0
+    steps:
+      - name: Fetch and verify the source-only candidate
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init -q source
+          git -C source fetch --no-tags --depth=3 "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_REF"
+          test "$(git -C source rev-parse FETCH_HEAD)" = "$GITHUB_SHA"
+          git -C source checkout --quiet --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD^^)" = "$UPSTREAM_COMMIT"
+          test "$(git -C source diff --name-only HEAD^ HEAD)" = '.github/workflows/qualify-release-pagination.yml'
+          git -C source checkout --quiet --detach HEAD^
+          test "$(git -C source diff --name-only "$UPSTREAM_COMMIT" HEAD)" = 'src/updater.rs'
+          test "$(git -C source show "$UPSTREAM_COMMIT:src/updater.rs" | git hash-object --stdin)" = "$UPDATER_BLOB"
+          git -C source diff --check "$UPSTREAM_COMMIT" HEAD
+          echo "SOURCE_ONLY_CANDIDATE=$(git -C source rev-parse HEAD)"
+      - name: Install pinned Rust toolchain
+        id: toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
+          rustup target add --toolchain "$RUST_VERSION" '${{ matrix.target }}'
+          rustc +"$RUST_VERSION" -vV
+      - name: Rustfmt
+        working-directory: source
+        run: cargo +"$RUST_VERSION" fmt --all --check
+      - name: Targeted regression tests
+        if: ${{ !cancelled() && steps.source.outcome == 'success' && steps.toolchain.outcome == 'success' }}
+        working-directory: source
+        run: RUST_MIN_STACK=524288 cargo +"$RUST_VERSION" test --locked release_catalog_pagination_tests
+      - name: Full upstream test suite
+        if: ${{ !cancelled() && steps.source.outcome == 'success' && steps.toolchain.outcome == 'success' }}
+        working-directory: source
+        run: RUST_MIN_STACK=524288 cargo +"$RUST_VERSION" test --all-targets --locked
+      - name: Clippy
+        if: ${{ !cancelled() && steps.source.outcome == 'success' && steps.toolchain.outcome == 'success' }}
+        working-directory: source
+        run: cargo +"$RUST_VERSION" clippy --all-targets --locked -- -D warnings
+      - name: musl target check
+        if: ${{ !cancelled() && steps.source.outcome == 'success' && steps.toolchain.outcome == 'success' }}
+        working-directory: source
+        run: cargo +"$RUST_VERSION" check --locked --target '${{ matrix.target }}'
+      - name: Verify the tested source has not changed
+        if: ${{ !cancelled() && steps.source.outcome == 'success' }}
+        working-directory: source
+        run: git diff --exit-code && git diff --cached --exit-code
