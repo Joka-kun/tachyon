@@ -1,0 +1,189 @@
+name: Discover Tachyon and Core candidate pairs
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: Explicit upstream tag, or leave empty for release discovery
+        required: false
+        type: string
+      upstream_commit:
+        description: Optional expected source commit
+        required: false
+        type: string
+      core_tag:
+        description: Explicit official Core tag, or leave empty for latest stable Core
+        required: false
+        type: string
+      channel:
+        description: Upstream release channel
+        type: choice
+        options: [preview, stable]
+        default: preview
+  schedule:
+    - cron: '17 3 * * *'
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: tachyon-discovery
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      commit: ${{ steps.resolve.outputs.commit }}
+      needed: ${{ steps.resolve.outputs.needed }}
+      core_tag: ${{ steps.core.outputs.tag }}
+      core_digest: ${{ steps.core.outputs.digest }}
+      core_bytes: ${{ steps.core.outputs.bytes }}
+      core_url: ${{ steps.core.outputs.url }}
+    env:
+      ADAPTER_COMMIT: 5762a842b6c5df8e9551419d8e5bd64fad05d399
+      REQUESTED_TAG: ${{ inputs.upstream_tag }}
+      REQUESTED_CORE: ${{ inputs.core_tag }}
+      EXPECTED_COMMIT: ${{ inputs.upstream_commit }}
+      CHANNEL: ${{ inputs.channel || 'preview' }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout own reviewed files
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Scan own history for privacy and secrets
+        shell: bash
+        run: python3 tools/local-update/privacy-scan.py history bbb601ec8f672e6adec1d50ca7179107c593ac7b HEAD
+      - name: Resolve release and avoid duplicate candidates
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$REQUESTED_TAG"
+          if [[ -z "$tag" ]]; then
+            tag="$(gh api 'repos/Dushnilin/tachyon/releases?per_page=50' --paginate | jq -rs --arg c "$CHANNEL" 'add | map(select(.draft == false and ($c == "preview" or .prerelease == false))) | first | .tag_name // empty')"
+          fi
+          [[ "$tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo NO_SUPPORTED_RELEASE_HOLD; exit 78; }
+          remote=https://github.com/Dushnilin/tachyon.git
+          commit="$(git ls-remote "$remote" "refs/tags/$tag^{}" | cut -f1)"
+          if [[ -z "$commit" ]]; then
+            commit="$(git ls-remote --refs "$remote" "refs/tags/$tag" | cut -f1)"
+          fi
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          if [[ -n "$EXPECTED_COMMIT" ]]; then
+            [[ "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+            test "$commit" = "$EXPECTED_COMMIT"
+          fi
+          needed=true
+          if [[ "$GITHUB_EVENT_NAME" == schedule ]]; then
+            name="tachyon-arm64-candidate-$commit-$ADAPTER_COMMIT"
+            count="$(gh api --method GET "repos/$GITHUB_REPOSITORY/actions/artifacts" -f name="$name" --paginate | jq -rs '[.[].artifacts[] | select(.expired == false)] | length')"
+            if [[ "$count" != 0 ]]; then needed=false; fi
+          fi
+          printf 'tag=%s\ncommit=%s\nneeded=%s\n' "$tag" "$commit" "$needed" >> "$GITHUB_OUTPUT"
+          printf 'Resolved %s at %s; build needed: %s\n' "$tag" "$commit" "$needed"
+
+      - name: Resolve official Core without republishing its binary
+        id: core
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$REQUESTED_CORE" ]]; then
+            gh api repos/Dushnilin/tachyon-core/releases/latest > core-release.json
+          else
+            [[ "$REQUESTED_CORE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || exit 78
+            gh api "repos/Dushnilin/tachyon-core/releases/tags/$REQUESTED_CORE" > core-release.json
+          fi
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          release = json.loads(Path("core-release.json").read_text())
+          tag = release["tag_name"]
+          assert re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", tag)
+          assert release["draft"] is False
+          requested = os.environ.get("REQUESTED_CORE", "")
+          assert tag == requested if requested else release["prerelease"] is False
+          name = f"tachyon-core-aarch64-{tag}.tar.gz"
+          url = f"https://github.com/Dushnilin/tachyon-core/releases/download/{tag}/{name}"
+          assets = [a for a in release["assets"] if a["name"] == name]
+          assert len(assets) == 1
+          asset = assets[0]
+          assert asset["state"] == "uploaded"
+          assert asset["browser_download_url"] == url
+          digest = asset["digest"]
+          assert re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+          size = asset["size"]
+          assert type(size) is int and 0 < size <= 16777216
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              print(f"tag={tag}", f"digest={digest[7:]}", f"bytes={size}", f"url={url}", sep="\n", file=out)
+          print("Official Core metadata verified:", tag, digest, size)
+          PY
+
+  qualify:
+    needs: discover
+    if: needs.discover.outputs.needed == 'true'
+    permissions:
+      contents: read
+    uses: Joka-kun/tachyon/.github/workflows/tachyon-arm64.yml@5762a842b6c5df8e9551419d8e5bd64fad05d399
+    with:
+      adapter_ref: 5762a842b6c5df8e9551419d8e5bd64fad05d399
+      upstream_tag: ${{ needs.discover.outputs.tag }}
+      upstream_commit: ${{ needs.discover.outputs.commit }}
+      channel: ${{ inputs.channel || 'preview' }}
+
+  pair:
+    needs: [discover, qualify]
+    if: ${{ always() && needs.discover.result == 'success' && (needs.qualify.result == 'success' || (needs.qualify.result == 'skipped' && needs.discover.outputs.needed == 'false')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TACHYON_TAG: ${{ needs.discover.outputs.tag }}
+      TACHYON_COMMIT: ${{ needs.discover.outputs.commit }}
+      ADAPTER_COMMIT: 5762a842b6c5df8e9551419d8e5bd64fad05d399
+      CORE_TAG: ${{ needs.discover.outputs.core_tag }}
+      CORE_SHA: ${{ needs.discover.outputs.core_digest }}
+      CORE_BYTES: ${{ needs.discover.outputs.core_bytes }}
+      CORE_URL: ${{ needs.discover.outputs.core_url }}
+    steps:
+      - name: Checkout own reviewed files
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Bind exact candidate artifact to official Core metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="tachyon-arm64-candidate-$TACHYON_COMMIT-$ADAPTER_COMMIT"
+          gh api --method GET "repos/$GITHUB_REPOSITORY/actions/artifacts" -f name="$name" --paginate | jq -s --arg n "$name" 'map(.artifacts[]) | map(select(.name == $n and .expired == false)) | sort_by(.id) | last' > artifact.json
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          a = json.loads(Path("artifact.json").read_text())
+          assert a and type(a["id"]) is int
+          assert re.fullmatch(r"sha256:[0-9a-f]{64}", a["digest"])
+          e = os.environ
+          result = {
+              "schema": 1,
+              "status": "CANDIDATE_PAIR_METADATA_ONLY",
+              "architecture": "aarch64-musl",
+              "tachyon": {"tag": e["TACHYON_TAG"], "source_commit": e["TACHYON_COMMIT"], "adapter_commit": e["ADAPTER_COMMIT"], "artifact_id": a["id"], "artifact_zip_sha256": a["digest"][7:]},
+              "core": {"tag": e["CORE_TAG"], "archive_url": e["CORE_URL"], "archive_sha256": e["CORE_SHA"], "archive_bytes": int(e["CORE_BYTES"]), "distribution": "official_upstream_only"},
+              "router_compatibility": "HOLD",
+              "stable_promotion": "HOLD",
+          }
+          Path("candidate-pair.json").write_text(json.dumps(result, indent=2) + "\n")
+          PY
+      - name: Scan pair metadata before upload
+        shell: bash
+        run: python3 tools/local-update/privacy-scan.py artifact candidate-pair.json
+      - name: Upload pair metadata only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pair-${{ env.TACHYON_COMMIT }}-${{ env.ADAPTER_COMMIT }}-${{ env.CORE_SHA }}
+          path: candidate-pair.json
+          if-no-files-found: error
+          retention-days: 14
