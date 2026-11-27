@@ -31,6 +31,14 @@ describe('release notes lookup', () => {
     expect(listReleases).toHaveBeenCalledWith('tachyon', 30, 1);
   });
 
+  it('matches a tag when only the optional v prefix differs', async () => {
+    const { getReleaseForNotes } = await import('../releaseNotes');
+    const prefixed = release('v2.0');
+    listReleases.mockResolvedValueOnce({ success: true, data: [prefixed] });
+
+    expect(await getReleaseForNotes('tachyon', '2.0')).toEqual(prefixed);
+  });
+
   it('matches a selected tag on a later page', async () => {
     const { getReleaseForNotes } = await import('../releaseNotes');
     const secondPage = [selected];
