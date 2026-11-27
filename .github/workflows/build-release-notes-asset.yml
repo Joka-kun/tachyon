@@ -34,6 +34,12 @@ jobs:
         working-directory: fe-app-tachyon
         run: npm run format
 
+      - name: Export formatter output for exact PR patch
+        run: |
+          echo "BEGIN_RELEASE_NOTES_TEST"
+          cat fe-app-tachyon/src/tachyon/tabs/updates/tests/releaseNotes.test.ts
+          echo "END_RELEASE_NOTES_TEST"
+
       - name: Run frontend tests
         working-directory: fe-app-tachyon
         run: npm run test -- --run
