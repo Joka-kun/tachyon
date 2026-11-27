@@ -1,4 +1,5 @@
 name: Build release-notes LuCI asset
+# Rebuild after the bounded release-catalogue search update.
 
 on:
   push:
