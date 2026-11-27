@@ -1,0 +1,178 @@
+diff --git a/src/config_gen.rs b/src/config_gen.rs
+index 0248f1e..9ebac0b 100644
+--- a/src/config_gen.rs
++++ b/src/config_gen.rs
+@@ -16336,6 +16336,7 @@ fn compile_core_config_with_rt_dir(
+             "detour": http_detour
+         }]);
+     }
++    crate::provider_admission::enforce(store, &mut root_cfg)?;
+     Ok(root_cfg)
+ }
+ 
+diff --git a/src/core_mgr.rs b/src/core_mgr.rs
+index d476dce..7d07b0c 100644
+--- a/src/core_mgr.rs
++++ b/src/core_mgr.rs
+@@ -4878,6 +4878,13 @@ impl CoreManager {
+             }
+         }
+         let mut candidate = self.state.data.read().await.clone();
++        let qualify_provider = if let Some(admission) = &candidate.provider_admission {
++            let policy = admission.policy()?;
++            fetched_results.iter().any(|res| res.id == policy.source_id && !res.nodes.is_empty())
++        } else {
++            false
++        };
++        let expected_store = qualify_provider.then(|| crate::provider_admission::store_digest(&candidate)).transpose()?;
+         let mut updated_sources = 0usize;
+         let mut persist_needed = false;
+         let mut core_reload_needed = false;
+@@ -4956,11 +4963,28 @@ impl CoreManager {
+             ));
+         }
+ 
++        if let Some(previous) = candidate.provider_admission.clone().filter(|_| qualify_provider) {
++            let admission = Box::pin(crate::provider_admission::qualify(&candidate, &previous)).await?;
++            self.state.live.write().await.push_event(
++                "info", "provider-admission",
++                &format!("Provider admission: tested={}, rejected={}, retained={}, admitted={}",
++                    admission.tested, admission.rejected, admission.retained, admission.identities.len()),
++            );
++            let patterns = crate::provider_admission::include_patterns(&candidate, &admission)?;
++            core_reload_needed |= crate::provider_admission::write_patterns(&mut candidate, patterns)?;
++            core_reload_needed |= previous.identities != admission.identities;
++            candidate.provider_admission = Some(admission);
++            persist_needed = true;
++        }
++
+         if persist_needed {
+-            if let Err(e) = transaction::commit_transaction_with_source(
+-                &self.state,
+-                candidate.clone(),
+-                "subscription",
++            let origin = if qualify_provider && core_reload_needed {
++                "qualified-provider-subscription"
++            } else {
++                "subscription"
++            };
++            if let Err(e) = transaction::commit_transaction_boxed_checked(
++                &self.state, Box::new(candidate.clone()), origin, None, expected_store,
+             )
+             .await
+             {
+diff --git a/src/main.rs b/src/main.rs
+index fe1a507..6d8fd56 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -14,6 +14,7 @@ mod core_mgr;
+ mod crypto_gen;
+ mod diagnostics;
+ mod fuzzer;
++mod provider_admission;
+ mod mcp;
+ mod net_stack;
+ mod net_stack_iptables;
+@@ -230,6 +231,7 @@ fn main() -> anyhow::Result<()> {
+             | "route_explain"
+             | "config_plan"
+             | "compile_config"
++            | "provider_qualify"
+             | "compile_nft"
+             | "compile_iptables"
+             | "reconcile-net"
+@@ -349,6 +351,14 @@ fn main() -> anyhow::Result<()> {
+                 println!("{}", serde_json::to_string_pretty(&plan)?);
+                 Ok(())
+             }
++            "provider_qualify" => {
++                let candidate = { state.data.read().await.clone() };
++                let previous = candidate.provider_admission.clone().unwrap_or_default();
++                let admission = Box::pin(provider_admission::qualify(&candidate, &previous)).await?;
++                let include_regex = provider_admission::include_patterns(&candidate, &admission)?;
++                println!("{}", serde_json::json!({"admission": admission, "include_regex": include_regex}));
++                Ok(())
++            }
+             "compile_config" => {
+                 let d = state.data.read().await;
+                 let cfg = config_gen::compile_core_config(&d)?;
+diff --git a/src/store.rs b/src/store.rs
+index 2197a97..3fb5cfe 100644
+--- a/src/store.rs
++++ b/src/store.rs
+@@ -3832,6 +3832,8 @@ pub struct RouterStoreData {
+     pub balancers: Vec<BalancerConfig>,
+     #[serde(default)]
+     pub outbound_groups: Vec<OutboundGroup>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub provider_admission: Option<crate::provider_admission::Admission>,
+     #[serde(default)]
+     pub servers: Vec<InboundServer>,
+     #[serde(default)]
+@@ -3857,6 +3859,7 @@ impl RouterStoreData {
+             outbound_sources: Vec::new(),
+             balancers: Vec::new(),
+             outbound_groups: Vec::new(),
++            provider_admission: None,
+             servers: Vec::new(),
+             profiles: Vec::new(),
+             schedules: Vec::new(),
+@@ -11199,6 +11202,7 @@ config telegram 'telegram'
+             outbound_sources: Vec::new(),
+             balancers: Vec::new(),
+             outbound_groups: Vec::new(),
++            provider_admission: None,
+             servers: Vec::new(),
+             profiles: Vec::new(),
+             schedules: Vec::new(),
+@@ -11792,6 +11796,7 @@ config section 'sec_v6'
+             outbound_sources: Vec::new(),
+             balancers: Vec::new(),
+             outbound_groups: Vec::new(),
++            provider_admission: None,
+             servers: Vec::new(),
+             profiles: Vec::new(),
+             schedules: Vec::new(),
+@@ -11942,6 +11947,7 @@ config guest_mode 'guest'
+             outbound_sources: Vec::new(),
+             balancers: Vec::new(),
+             outbound_groups: Vec::new(),
++            provider_admission: None,
+             servers: Vec::new(),
+             profiles: Vec::new(),
+             schedules: Vec::new(),
+diff --git a/src/transaction.rs b/src/transaction.rs
+index 5f07f5b..069d2d7 100644
+--- a/src/transaction.rs
++++ b/src/transaction.rs
+@@ -675,6 +675,18 @@ pub fn commit_transaction_boxed_in_history_dir<'a>(
+     hist_dir: Option<std::path::PathBuf>,
+ ) -> std::pin::Pin<
+     Box<dyn std::future::Future<Output = anyhow::Result<ConfigPlanReport>> + Send + 'a>,
++> {
++    commit_transaction_boxed_checked(state, candidate, source, hist_dir, None)
++}
++
++pub fn commit_transaction_boxed_checked<'a>(
++    state: &'a Arc<AppState>,
++    candidate: Box<RouterStoreData>,
++    source: &'a str,
++    hist_dir: Option<std::path::PathBuf>,
++    expected_store: Option<[u8; 32]>,
++) -> std::pin::Pin<
++    Box<dyn std::future::Future<Output = anyhow::Result<ConfigPlanReport>> + Send + 'a>,
+ > {
+     Box::pin(async move {
+         let _commit_guard = commit_lock().lock().await;
+@@ -708,6 +720,11 @@ pub fn commit_transaction_boxed_in_history_dir<'a>(
+         // Phase 4: MUTATE (persist store JSON before writing compiled core config)
+         {
+             let mut d = state.data.write().await;
++            if let Some(expected) = expected_store
++                && crate::provider_admission::store_digest(&d)? != expected
++            {
++                anyhow::bail!("Tachyon configuration changed while qualifying provider candidates");
++            }
+             std::mem::swap(&mut *d, &mut *candidate);
+         }
+         drop(candidate);
