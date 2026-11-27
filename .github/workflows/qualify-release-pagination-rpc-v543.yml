@@ -1,0 +1,75 @@
+name: Qualify native release catalog RPC (mount isolated)
+on:
+  push:
+    branches:
+      - qualification/release-pagination-rpc-v543
+permissions:
+  contents: read
+jobs:
+  rpc:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: \${{ matrix.runner }}
+    timeout-minutes: 25
+    env:
+      BASE: ba060231d301ddcf97a0caf7a0c1df2963d0c65f
+      CANDIDATE: 5ded7e82497fe9e1911fd951be03850cecaf7f58
+      SCRIPT_COMMIT: 78884bebd255618722317b99f62c74a55f61e93a
+      SCRIPT_SHA256: 0aab1c49217c0575ab61053a840ca23275922c13c63432f9993aa5b2aba04f05
+      RUST_VERSION: 1.100.0
+    steps:
+      - name: Verify exact source and qualification assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init -q source
+          git -C source fetch --no-tags --depth=4 "https://github.com/\${GITHUB_REPOSITORY}.git" "\${GITHUB_REF}"
+          test "$(git -C source rev-parse FETCH_HEAD)" = "\${GITHUB_SHA}"
+          git -C source checkout --quiet --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD^)" = "$SCRIPT_COMMIT"
+          test "$(git -C source rev-parse HEAD^^)" = "$CANDIDATE"
+          test "$(git -C source rev-parse HEAD^^^)" = "$BASE"
+          test "$(git -C source diff --name-only "$BASE" "$CANDIDATE")" = 'src/updater.rs'
+          test "$(git -C source rev-parse "$CANDIDATE:src/updater.rs")" = '8c5b70209a49a8e2f8d8c671eeb60c322910d4d9'
+          test "$(git -C source rev-parse "$BASE:src/updater.rs")" = '42ea43d3264d877203d58f06a3a34ac763e0933b'
+          test "$(git -C source diff --name-only HEAD^^ HEAD^)" = 'tools/qualification/native-release-rpc-dns.py'
+          test "$(git -C source diff --name-only HEAD^ HEAD)" = '.github/workflows/qualify-release-pagination-rpc-v543.yml'
+          test "$(git -C source diff --name-only "$CANDIDATE" HEAD)" = $'.github/workflows/qualify-release-pagination-rpc-v543.yml\ntools/qualification/native-release-rpc-dns.py'
+          cp source/tools/qualification/native-release-rpc-dns.py "$RUNNER_TEMP/native-release-rpc-dns.py"
+          echo "$SCRIPT_SHA256  $RUNNER_TEMP/native-release-rpc-dns.py" | sha256sum -c -
+          git -C source checkout --quiet --detach "$CANDIDATE"
+      - name: Build candidate and unchanged upstream
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          CARGO_TARGET_DIR="$RUNNER_TEMP/candidate-build" cargo +"$RUST_VERSION" build --locked --bin tachyon
+          git checkout --quiet --detach "$BASE"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/baseline-build" cargo +"$RUST_VERSION" build --locked --bin tachyon
+          git checkout --quiet --detach "$CANDIDATE"
+          test -z "$(git status --porcelain --untracked-files=no)"
+      - name: Differential native RPC in isolated network and mount namespaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          outer_net="$(readlink /proc/self/ns/net)"
+          outer_mnt="$(readlink /proc/self/ns/mnt)"
+          run_uid="$(id -u)"
+          run_gid="$(id -g)"
+          sudo env OUTER_NET="$outer_net" OUTER_MNT="$outer_mnt" RUN_UID="$run_uid" RUN_GID="$run_gid" RUNNER_TEMP="$RUNNER_TEMP" PATH="$PATH" unshare --net --mount --fork -- bash -s <<'NS'
+          set -euo pipefail
+          mount --make-rprivate /
+          mount -t tmpfs -o size=256m,mode=755,nosuid,nodev tmpfs /run
+          mount -t tmpfs -o size=512m,mode=1777,nosuid,nodev tmpfs /tmp
+          ip link set lo up
+          test "$(readlink /proc/self/ns/net)" != "$OUTER_NET"
+          test "$(readlink /proc/self/ns/mnt)" != "$OUTER_MNT"
+          test "$(stat -f -c %T /run)" = tmpfs
+          test "$(stat -f -c %T /tmp)" = tmpfs
+          exec setpriv --reuid="$RUN_UID" --regid="$RUN_GID" --clear-groups \
+            env OUTER_NET="$OUTER_NET" OUTER_MNT="$OUTER_MNT" RUNNER_TEMP="$RUNNER_TEMP" PATH="$PATH" TMPDIR=/tmp \
+            python3 "$RUNNER_TEMP/native-release-rpc-dns.py" "$RUNNER_TEMP/baseline-build/debug/tachyon" "$RUNNER_TEMP/candidate-build/debug/tachyon"
+          NS
