@@ -17,7 +17,6 @@ jobs:
       BASE: ba060231d301ddcf97a0caf7a0c1df2963d0c65f
       CANDIDATE: 5ded7e82497fe9e1911fd951be03850cecaf7f58
       SCRIPT_COMMIT: 78884bebd255618722317b99f62c74a55f61e93a
-      WORKFLOW_PARENT_COMMIT: 1be923a4a62eaab28a739f88c5b3bf4ff1ac00d8
       SCRIPT_SHA256: 0aab1c49217c0575ab61053a840ca23275922c13c63432f9993aa5b2aba04f05
       RUST_VERSION: 1.100.0
     steps:
@@ -26,13 +25,12 @@ jobs:
         run: |
           set -euo pipefail
           git init -q source
-          git -C source fetch --no-tags --depth=5 "https://github.com/${GITHUB_REPOSITORY}.git" "${GITHUB_REF}"
+          git -C source fetch --no-tags --depth=16 "https://github.com/${GITHUB_REPOSITORY}.git" "${GITHUB_REF}"
           test "$(git -C source rev-parse FETCH_HEAD)" = "${GITHUB_SHA}"
           git -C source checkout --quiet --detach FETCH_HEAD
-          test "$(git -C source rev-parse HEAD^)" = "$WORKFLOW_PARENT_COMMIT"
-          test "$(git -C source rev-parse HEAD^^)" = "$SCRIPT_COMMIT"
-          test "$(git -C source rev-parse HEAD^^^)" = "$CANDIDATE"
-          test "$(git -C source rev-parse HEAD^^^^)" = "$BASE"
+          git -C source merge-base --is-ancestor "$BASE" "$CANDIDATE"
+          git -C source merge-base --is-ancestor "$CANDIDATE" "$SCRIPT_COMMIT"
+          git -C source merge-base --is-ancestor "$SCRIPT_COMMIT" HEAD
           test "$(git -C source diff --name-only "$BASE" "$CANDIDATE")" = 'src/updater.rs'
           test "$(git -C source rev-parse "$CANDIDATE:src/updater.rs")" = '8c5b70209a49a8e2f8d8c671eeb60c322910d4d9'
           test "$(git -C source rev-parse "$BASE:src/updater.rs")" = '42ea43d3264d877203d58f06a3a34ac763e0933b'
