@@ -1,0 +1,125 @@
+name: Rebuild PR 532 qualification v569
+on:
+  push:
+    branches:
+      - qualification/rebuild-pr532-v569
+permissions:
+  contents: read
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Reproduce reviewed merge and exact frontend tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          upstream=a33831cc4e92f9fc3614f9cd361e51e4aafd9c9c
+          old=0e6a38ce03b3ab3c80e1ea9509b5800486cc620f
+          tree=7b116bd1f12e41f3a01be94abfa8e121640376d9
+          main=luci-app-tachyon/htdocs/luci-static/resources/view/tachyon/main.js
+          git fetch --no-tags origin "$old" "$upstream"
+          git checkout --detach "$upstream"
+          export GIT_AUTHOR_NAME=Joka-kun GIT_COMMITTER_NAME=Joka-kun
+          export GIT_AUTHOR_EMAIL=24525902+Joka-kun@users.noreply.github.com
+          export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+          if ! git merge --no-commit --no-ff "$old"; then
+            [[ "$(git diff --name-only --diff-filter=U)" == "$main" ]] || { echo MERGE_SCOPE_HOLD; exit 78; }
+            git checkout --ours -- "$main"
+            git add -- "$main"
+          fi
+          [[ -z "$(git diff --name-only --diff-filter=U)" ]] || exit 78
+          cd fe-app-tachyon
+          npm ci
+          npm run locales:actualize
+          npm run ci
+          cd ..
+          for p in fe-app-tachyon/locales/tachyon.pot luci-app-tachyon/po/templates/tachyon.pot; do
+            sed -i -E 's/(POT-Creation-Date: |PO-Revision-Date: )[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}[+-][0-9]{4}/\12026-11-27 22:37+0000/' "$p"
+          done
+          for p in fe-app-tachyon/locales/tachyon.ru.po luci-app-tachyon/po/ru/tachyon.po; do
+            git diff -I POT-Creation-Date -I PO-Revision-Date --quiet "$upstream" -- "$p" || { echo LOCALE_SCOPE_HOLD; exit 78; }
+            git restore --source="$upstream" --staged --worktree -- "$p"
+          done
+          cat >/tmp/pr532.sha256 <<'EOF'
+          40fa2909cd81eb1f06a140cc607fb068e6b5c8e2a85bdcf757e3b494f7f58290  fe-app-tachyon/locales/tachyon.pot
+          79c4b932fe31d166cd0bf802d4625540622e77007c7b6234c28227f9d91c8fab  fe-app-tachyon/src/tachyon/tabs/updates/initController.ts
+          3f4afa7e43557a4bfc075732b5d536d8e91c5e0272f865329fbf56f7e7a8acfd  fe-app-tachyon/src/tachyon/tabs/updates/releaseNotes.ts
+          154fcbe3329ebf56ff2eb10782be573393b4d1a10f38e9675b80910cc3dad2b5  fe-app-tachyon/src/tachyon/tabs/updates/tests/releaseNotes.test.ts
+          11a3cd8ca599e3661e67e7b568858d5c351a7f3a83c12375e145db8bfc15010b  luci-app-tachyon/htdocs/luci-static/resources/view/tachyon/main.js
+          40fa2909cd81eb1f06a140cc607fb068e6b5c8e2a85bdcf757e3b494f7f58290  luci-app-tachyon/po/templates/tachyon.pot
+          EOF
+          sha256sum -c /tmp/pr532.sha256
+          while read -r hash path; do git add -- "$path"; done </tmp/pr532.sha256
+          git diff --quiet
+          [[ "$(git write-tree)" == "$tree" ]] || { echo EXACT_TREE_HOLD; exit 78; }
+          export GIT_AUTHOR_DATE='2026-11-27T22:37:00Z' GIT_COMMITTER_DATE='2026-11-27T22:37:00Z'
+          candidate=$(printf '%s\n' 'Merge upstream 2.0 for release notes qualification' | git -c commit.gpgsign=false commit-tree "$tree" -p "$old" -p "$upstream")
+          [[ "$(git show -s --format=%P "$candidate")" == "$old $upstream" ]]
+          [[ "$(git show -s --format='%an|%ae|%cn|%ce' "$candidate")" == 'Joka-kun|24525902+Joka-kun@users.noreply.github.com|Joka-kun|24525902+Joka-kun@users.noreply.github.com' ]]
+          git update-ref refs/heads/v569-candidate "$candidate"
+          git bundle create /tmp/pr532.bundle refs/heads/v569-candidate "^$old" "^$upstream"
+          echo EXACT_TREE_PASS
+          echo "QUALIFICATION_COMMIT $candidate"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr532-exact-tree-v569
+          path: /tmp/pr532.bundle
+          retention-days: 7
+          if-no-files-found: error
+  publish:
+    needs: rebuild
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: pr532-exact-tree-v569
+          path: /tmp/pr532
+      - name: Verify and create only the qualification ref
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          upstream=a33831cc4e92f9fc3614f9cd361e51e4aafd9c9c
+          old=0e6a38ce03b3ab3c80e1ea9509b5800486cc620f
+          tree=7b116bd1f12e41f3a01be94abfa8e121640376d9
+          dest=refs/heads/qualification/pr532-v565
+          fork=https://github.com/Joka-kun/tachyon.git
+          [[ "$GITHUB_REPOSITORY" == Joka-kun/tachyon ]]
+          git fetch --no-tags origin "$old" "$upstream"
+          git bundle verify /tmp/pr532/pr532.bundle
+          git fetch /tmp/pr532/pr532.bundle refs/heads/v569-candidate:refs/heads/v569-candidate
+          candidate=$(git rev-parse refs/heads/v569-candidate)
+          [[ "$(git rev-parse "$candidate^{tree}")" == "$tree" ]]
+          [[ "$(git show -s --format=%P "$candidate")" == "$old $upstream" ]]
+          [[ "$(git show -s --format='%an|%ae|%cn|%ce' "$candidate")" == 'Joka-kun|24525902+Joka-kun@users.noreply.github.com|Joka-kun|24525902+Joka-kun@users.noreply.github.com' ]]
+          [[ "$(git ls-remote https://github.com/Dushnilin/tachyon.git refs/heads/2.0 | cut -f1)" == "$upstream" ]] || { echo UPSTREAM_CHANGED_HOLD; exit 78; }
+          [[ "$(git ls-remote "$fork" refs/heads/codex/release-notes-selected-tag | cut -f1)" == "$old" ]] || { echo PR_HEAD_CHANGED_HOLD; exit 78; }
+          existing=$(git ls-remote "$fork" "$dest" | cut -f1)
+          if [[ "$existing" == "$candidate" ]]; then
+            echo QUALIFICATION_BRANCH_ALREADY_PRESENT
+          elif [[ -z "$existing" ]]; then
+            gh auth setup-git --hostname github.com
+            git push --force-with-lease="$dest:" "$fork" "$candidate:$dest"
+          else
+            echo QUALIFICATION_BRANCH_EXISTS_HOLD
+            exit 78
+          fi
+          [[ "$(git ls-remote "$fork" "$dest" | cut -f1)" == "$candidate" ]]
+          echo "QUALIFICATION_COMMIT $candidate"
+          echo QUALIFICATION_BRANCH_VERIFIED
