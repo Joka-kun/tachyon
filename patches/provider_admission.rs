@@ -8,7 +8,7 @@ use std::{
     collections::{BTreeSet, HashSet},
     fs,
     os::unix::fs::DirBuilderExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 /// Router-local binding; no deployment identifiers are compiled into the binary.
@@ -229,8 +229,16 @@ impl Drop for Scratch {
 }
 
 pub async fn qualify(store: &RouterStoreData, previous: &Admission) -> Result<Admission> {
-    let policy = previous.policy()?.clone();
+    let policy = previous.policy()?;
     let graph = crate::config_gen::compile_core_config(store)?;
+    let candidates = global_candidates(&graph, &policy.global_auto_tag);
+    if candidates.is_empty() {
+        return Ok(Admission {
+            policy: previous.policy.clone(),
+            checked_at: previous.checked_at,
+            ..Admission::default()
+        });
+    }
     let path = std::env::temp_dir().join(format!(
         "tachyon-provider-{}-{:016x}",
         std::process::id(),
@@ -242,7 +250,7 @@ pub async fn qualify(store: &RouterStoreData, previous: &Admission) -> Result<Ad
     fs::write(work.0.join("graph.json"), serde_json::to_vec(&graph)?)?;
     // The shell helper has a bounded, loopback-only test Core and no publishing privileges of its own.
     // Partial results are usable if the helper times out, since each result is published atomically.
-    let _ = tokio::process::Command::new("/usr/bin/timeout")
+    let helper_succeeded = tokio::process::Command::new("/usr/bin/timeout")
         .args(["240", "/usr/libexec/tachyon-provider-qualify"])
         .arg(&work.0)
         .env("TACHYON_ADMISSION_GLOBAL_AUTO", &policy.global_auto_tag)
@@ -251,17 +259,32 @@ pub async fn qualify(store: &RouterStoreData, previous: &Admission) -> Result<Ad
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
         .status()
-        .await;
+        .await
+        .is_ok_and(|status| status.success());
+    Ok(collect_results(
+        previous,
+        candidates,
+        &work.0.join("results"),
+        helper_succeeded,
+    ))
+}
+
+fn collect_results(
+    previous: &Admission,
+    candidates: Vec<(usize, &str, String)>,
+    results_dir: &Path,
+    helper_succeeded: bool,
+) -> Admission {
+    let candidate_count = candidates.len();
     let mut admission = Admission {
-        policy: Some(policy.clone()),
-        checked_at: unix_now_secs(),
+        policy: previous.policy.clone(),
+        checked_at: previous.checked_at,
         ..Admission::default()
     };
     let mut rejected = BTreeSet::new();
     let mut retained = BTreeSet::new();
-    for (index, _, hash) in global_candidates(&graph, &policy.global_auto_tag) {
-        let result =
-            fs::read_to_string(work.0.join("results").join(index.to_string())).unwrap_or_default();
+    for (index, _, hash) in candidates {
+        let result = fs::read_to_string(results_dir.join(index.to_string())).unwrap_or_default();
         match result.trim() {
             "pass" => {
                 admission.tested += 1;
@@ -281,7 +304,10 @@ pub async fn qualify(store: &RouterStoreData, previous: &Admission) -> Result<Ad
     admission.retained = retained.difference(&rejected).count();
     admission.identities.extend(retained);
     admission.identities.retain(|hash| !rejected.contains(hash));
-    Ok(admission)
+    if helper_succeeded && admission.tested > 0 && admission.tested == candidate_count {
+        admission.checked_at = unix_now_secs();
+    }
+    admission
 }
 
 #[cfg(test)]
@@ -320,6 +346,69 @@ mod tests {
         assert_eq!(identity(&config, "A").as_deref(), Some(before.as_str()));
         config["outbounds"][0]["server_port"] = json!(9443);
         assert_ne!(identity(&config, "A").as_deref(), Some(before.as_str()));
+    }
+
+    #[test]
+    fn only_a_complete_nonempty_qualification_updates_checked_at() {
+        let policy = fixture_policy("fixture");
+        let graph = graph(&policy);
+        let previous = Admission {
+            policy: Some(policy.clone()),
+            identities: [identity(&graph, "B").unwrap()].into(),
+            checked_at: 42,
+            ..Default::default()
+        };
+        let path =
+            std::env::temp_dir().join(format!("qualification-test-{:016x}", rand::random::<u64>()));
+        fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        let work = Scratch(path);
+        let collect = |ok| {
+            collect_results(
+                &previous,
+                global_candidates(&graph, &policy.global_auto_tag),
+                &work.0,
+                ok,
+            )
+        };
+
+        assert_eq!(
+            collect_results(&previous, vec![], &work.0, true).checked_at,
+            42
+        );
+        fs::write(work.0.join("1"), "pass\n").unwrap();
+        fs::write(work.0.join("2"), "inconclusive\n").unwrap();
+        let partial = collect(true);
+        assert_eq!(
+            (partial.checked_at, partial.tested, partial.retained),
+            (42, 1, 1)
+        );
+        assert!(partial.identities.contains(&identity(&graph, "B").unwrap()));
+
+        fs::write(work.0.join("2"), "reject\n").unwrap();
+        let failed = collect(false);
+        assert_eq!(failed.checked_at, 42);
+        assert!(!failed.identities.contains(&identity(&graph, "B").unwrap()));
+        let complete = collect(true);
+        assert!(complete.checked_at > 42);
+        assert_eq!(
+            (complete.tested, complete.rejected, complete.retained),
+            (2, 1, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_graph_drops_stale_identities_without_refreshing_the_check() {
+        let previous = Admission {
+            policy: Some(fixture_policy("empty")),
+            identities: ["stale".to_string()].into(),
+            checked_at: 42,
+            ..Default::default()
+        };
+        let store = RouterStoreData::factory_defaults();
+        let result = qualify(&store, &previous).await.unwrap();
+        assert_eq!(result.checked_at, 42);
+        assert!(result.identities.is_empty());
+        assert_eq!(result.tested, 0);
     }
 
     #[test]

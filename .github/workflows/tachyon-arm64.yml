@@ -51,7 +51,7 @@ jobs:
     timeout-minutes: 30
     env:
       PATCH_SHA: c13a803147cd9bf06811258289da69ef8d7ecf66ac75b0dbd61ba22ea622fb8e
-      MODULE_SHA: 9f415d81c495c1d26f22509ef4cba2e67c2d41aaf345ae143b591087f99d828d
+      MODULE_SHA: af4db40c2e94c58260f612d470f7806385f3fa25cc24ebd403d6574f9d827c50
       CARGO_BUILD_JOBS: "3"
     steps:
       - name: Checkout reviewed patch set
