@@ -4575,24 +4575,7 @@ impl CoreManager {
             .await
             .ok();
 
-        // Map section ID -> mixed_proxy_port for optional proxy-routed subscription fetches
-        let sec_proxy_ports: HashMap<String, u16> = snapshot
-            .sections
-            .iter()
-            .filter(|s| s.enabled && s.mixed_proxy_enabled && s.mixed_proxy_port > 0)
-            .map(|s| (s.id.clone(), s.mixed_proxy_port))
-            .collect();
-        let eff_core_cfg = Self::effective_core_config_path_for(&self.state, &snapshot.settings);
-        let service_mixed_port =
-            read_service_mixed_port_from_config(&eff_core_cfg.to_string_lossy());
-        let global_sub_proxy = if snapshot.settings.download_lists_via_proxy {
-            sec_proxy_ports
-                .get(&snapshot.settings.download_lists_via_proxy_section)
-                .copied()
-                .or(service_mixed_port)
-        } else {
-            None
-        };
+        let proxy_context = SubscriptionProxyContext::capture(&self.state, &snapshot);
 
         struct SubFetchResult {
             id: String,
@@ -4613,10 +4596,14 @@ impl CoreManager {
             }
             let mut src = orig_src.clone();
             let enc_src_id = crate::store::url_encode_component(&src.id);
-            let put_ok = self
-                .clash_request("PUT", &format!("/providers/proxies/{enc_src_id}"), None)
-                .await
-                .is_ok();
+            // A successful provider inventory can prove that this source has
+            // no native provider to refresh. Unknown inventories keep the
+            // existing attempt behavior.
+            let put_ok = native_provider_refresh_needed(providers_map.as_ref(), &src.id)
+                && self
+                    .clash_request("PUT", &format!("/providers/proxies/{enc_src_id}"), None)
+                    .await
+                    .is_ok();
             let fresh_providers = if put_ok {
                 self.clash_request("GET", "/providers/proxies", None)
                     .await
@@ -4627,7 +4614,7 @@ impl CoreManager {
 
             // Check if `tachyon-core` `/providers/proxies` has `subscriptionInfo` for this source
             if let Some(pmap) = fresh_providers.as_ref().or(providers_map.as_ref())
-                && let Some(prov) = pmap.pointer(&format!("/providers/{}", src.id))
+                && let Some(prov) = pmap.get("providers").and_then(|p| p.get(&src.id))
                 && let Some(sub_info) = prov.get("subscriptionInfo")
             {
                 if let Some(u) = sub_info.get("Upload").and_then(Value::as_u64) {
@@ -4644,23 +4631,9 @@ impl CoreManager {
                 }
             }
 
-            let explicit_proxy_opt = if src.download_via_proxy_enabled {
-                sec_proxy_ports
-                    .get(&src.download_via_proxy_section)
-                    .copied()
-                    .or(global_sub_proxy)
-                    .or(service_mixed_port)
-            } else {
-                global_sub_proxy
-            }
-            .map(|p| format!("http://127.0.0.1:{p}"));
-            let auto_fallback_proxy_opt = if explicit_proxy_opt.is_none() {
-                service_mixed_port
-                    .or_else(|| sec_proxy_ports.values().copied().min())
-                    .map(|p| format!("http://127.0.0.1:{p}"))
-            } else {
-                None
-            };
+            let (explicit_port, fallback_port) = proxy_context.ports_for(&src);
+            let explicit_proxy_opt = explicit_port.map(|p| format!("http://127.0.0.1:{p}"));
+            let auto_fallback_proxy_opt = fallback_port.map(|p| format!("http://127.0.0.1:{p}"));
 
             let extra_headers = Self::build_subscription_request_headers(&src);
             let hwid_free_headers = Self::build_subscription_request_headers_inner(&src, false);
@@ -5083,13 +5056,14 @@ impl CoreManager {
 
         // Re-read fresh state right before committing so concurrent config edits are preserved.
         let finish_ts = unix_now_secs().max(now);
-        {
-            let mut attempts = self.sub_last_attempt.lock().await;
-            for res in &fetched_results {
-                attempts.insert(res.id.clone(), finish_ts);
-            }
-        }
-        let mut candidate = self.state.data.read().await.clone();
+        let (expected, mut candidate) = {
+            let current = self.state.data.read().await;
+            (
+                transaction::ExpectedStore::capture(&self.state, &current)?,
+                current.clone(),
+            )
+        };
+        let current_proxy_context = SubscriptionProxyContext::capture(&self.state, &candidate);
         let mut updated_sources = 0usize;
         let mut persist_needed = false;
         let mut core_reload_needed = false;
@@ -5103,6 +5077,17 @@ impl CoreManager {
             else {
                 continue;
             };
+            // The ID alone is not enough: a request may have been in flight
+            // while its source was edited. Do not apply old nodes or metadata.
+            if !snapshot
+                .outbound_sources
+                .iter()
+                .any(|original| subscription_request_unchanged(original, src))
+                || proxy_context.config_path != current_proxy_context.config_path
+                || proxy_context.ports_for(src) != current_proxy_context.ports_for(src)
+            {
+                continue;
+            }
             let static_meta_changed = src.sub_title != res.updated_src.sub_title
                 || src.sub_support_url != res.updated_src.sub_support_url
                 || src.sub_web_page_url != res.updated_src.sub_web_page_url
@@ -5168,11 +5153,14 @@ impl CoreManager {
             ));
         }
 
+        // Only record attempts after the optimistic commit succeeds.
+        let mut applied_attempts = Vec::new();
         if persist_needed {
-            if let Err(e) = transaction::commit_transaction_with_source(
+            if let Err(e) = transaction::commit_transaction_if_current(
                 &self.state,
-                candidate.clone(),
+                candidate,
                 "subscription",
+                expected,
             )
             .await
             {
@@ -5183,28 +5171,46 @@ impl CoreManager {
                 );
                 return Err(e);
             }
-            crate::ubus_bridge::sync_from_store_to_json_and_cache(&candidate);
+            applied_attempts.extend(mem_updates.iter().map(|(id, ..)| id.clone()));
+            // The transaction may normalize the candidate. Publish the actual
+            // committed store, not a pre-transaction clone.
+            {
+                let committed = self.state.data.read().await;
+                crate::ubus_bridge::sync_from_store_to_json_and_cache(&committed);
+            }
             if core_reload_needed && !self.is_manually_stopped() {
                 let _ = self.apply_or_reload().await;
             }
         } else if !mem_updates.is_empty() {
             let mut d = self.state.data.write().await;
+            expected.ensure_current(&self.state, &d)?;
             for (id, ts, err, up, down, pref_ua) in mem_updates {
                 if let Some(src) = d
                     .outbound_sources
                     .iter_mut()
                     .find(|s| s.id == id && s.source_type == "subscription")
+                    && snapshot
+                        .outbound_sources
+                        .iter()
+                        .any(|original| subscription_request_unchanged(original, src))
                 {
                     src.last_updated_unix = ts;
                     src.sub_last_error = err;
                     src.sub_upload_bytes = up;
                     src.sub_download_bytes = down;
                     src.sub_preferred_user_agent = pref_ua;
+                    applied_attempts.push(id);
                 }
             }
+            self.state.bump_generation();
             crate::ubus_bridge::sync_from_store_to_json_and_cache(&d);
             drop(d);
-            self.state.bump_generation();
+        }
+        if !applied_attempts.is_empty() {
+            let mut attempts = self.sub_last_attempt.lock().await;
+            for id in applied_attempts {
+                attempts.insert(id, finish_ts);
+            }
         }
         Ok(updated_sources)
     }
@@ -7694,6 +7700,114 @@ fn canonical_node_fingerprint(node: &crate::store::ParsedProxyNode) -> Value {
     })
 }
 
+// Only an actual provider map can establish absence. A failed or unsupported
+// GET must not disable native refresh.
+fn native_provider_refresh_needed(listing: Option<&Value>, source_id: &str) -> bool {
+    listing
+        .and_then(|v| v.get("providers"))
+        .and_then(Value::as_object)
+        .is_none_or(|providers| providers.contains_key(source_id))
+}
+
+// Resolve fetch endpoints once, using the same logic before and after network I/O.
+// This is an endpoint guard, not a proof of the route behind a mixed port.
+struct SubscriptionProxyContext {
+    config_path: PathBuf,
+    section_ports: HashMap<String, u16>,
+    service_port: Option<u16>,
+    global_port: Option<u16>,
+}
+
+impl SubscriptionProxyContext {
+    fn capture(state: &AppState, store: &crate::store::RouterStoreData) -> Self {
+        let config_path = CoreManager::effective_core_config_path_for(state, &store.settings);
+        let service_port = read_service_mixed_port_from_config(&config_path.to_string_lossy());
+        Self::from_store(store, config_path, service_port)
+    }
+
+    fn from_store(
+        store: &crate::store::RouterStoreData,
+        config_path: PathBuf,
+        service_port: Option<u16>,
+    ) -> Self {
+        let section_ports: HashMap<String, u16> = store
+            .sections
+            .iter()
+            .filter(|s| s.enabled && s.mixed_proxy_enabled && s.mixed_proxy_port > 0)
+            .map(|s| (s.id.clone(), s.mixed_proxy_port))
+            .collect();
+        let global_port = if store.settings.download_lists_via_proxy {
+            section_ports
+                .get(&store.settings.download_lists_via_proxy_section)
+                .copied()
+                .or(service_port)
+        } else {
+            None
+        };
+        Self {
+            config_path,
+            section_ports,
+            service_port,
+            global_port,
+        }
+    }
+
+    fn ports_for(&self, src: &crate::store::OutboundSource) -> (Option<u16>, Option<u16>) {
+        let explicit = if src.download_via_proxy_enabled {
+            self.section_ports
+                .get(&src.download_via_proxy_section)
+                .copied()
+                .or(self.global_port)
+                .or(self.service_port)
+        } else {
+            self.global_port
+        };
+        let fallback = if explicit.is_none() {
+            self.service_port
+                .or_else(|| self.section_ports.values().copied().min())
+        } else {
+            None
+        };
+        (explicit, fallback)
+    }
+}
+
+// Compare the source inputs captured before network I/O, not the fetched
+// metadata or the lossy node-reload fingerprint. This is a source-level
+// guard; it does not replace transaction-level concurrency control.
+fn subscription_request_unchanged(
+    original: &crate::store::OutboundSource,
+    current: &crate::store::OutboundSource,
+) -> bool {
+    original.id == current.id
+        && original.source_type == current.source_type
+        && original.enabled == current.enabled
+        && original.subscription_urls == current.subscription_urls
+        && original.subscription_update_interval == current.subscription_update_interval
+        && original.subscription_update_jitter == current.subscription_update_jitter
+        && original.subscription_update_enabled == current.subscription_update_enabled
+        && original.subscription_engine == current.subscription_engine
+        && original.subscription_insecure == current.subscription_insecure
+        && original.subscription_filter_include_keywords
+            == current.subscription_filter_include_keywords
+        && original.subscription_filter_exclude_keywords
+            == current.subscription_filter_exclude_keywords
+        && original.download_via_proxy_enabled == current.download_via_proxy_enabled
+        && original.download_via_proxy_section == current.download_via_proxy_section
+        && original.auto_user_agent == current.auto_user_agent
+        && original.user_agent == current.user_agent
+        && original.sub_preferred_user_agent == current.sub_preferred_user_agent
+        && original.auto_hwid == current.auto_hwid
+        && original.hwid == current.hwid
+        && original.custom_device_headers == current.custom_device_headers
+        && original.device_os == current.device_os
+        && original.ver_os == current.ver_os
+        && original.device_model == current.device_model
+        && original.device_locale == current.device_locale
+        && original.app_version == current.app_version
+        && original.accept_language == current.accept_language
+}
+
 fn nodes_materially_equal(
     old_nodes: &[crate::store::ParsedProxyNode],
     new_nodes: &[crate::store::ParsedProxyNode],
@@ -7977,6 +8091,136 @@ fn parse_subscription_interval_secs(raw: &str) -> u64 {
 mod core_mgr_tests {
     use super::*;
     use crate::store::ParsedProxyNode;
+
+    #[test]
+    fn test_native_provider_refresh_skips_only_proven_absence() {
+        assert!(native_provider_refresh_needed(None, "source"));
+        assert!(native_provider_refresh_needed(
+            Some(&json!({"providers": null})),
+            "source"
+        ));
+        assert!(native_provider_refresh_needed(Some(&json!({})), "source"));
+        assert!(!native_provider_refresh_needed(
+            Some(&json!({"providers": {}})),
+            "source"
+        ));
+        let listing = json!({"providers": {"source": {}, "a/b~c": {}}});
+        assert!(native_provider_refresh_needed(Some(&listing), "source"));
+        assert!(native_provider_refresh_needed(Some(&listing), "a/b~c"));
+        assert!(!native_provider_refresh_needed(Some(&listing), "missing"));
+    }
+
+    #[test]
+    fn test_subscription_proxy_context_detects_endpoint_changes() {
+        let mut store = crate::store::RouterStoreData::default();
+        store.sections.clear();
+        store.sections.push(crate::store::RoutingSection {
+            id: "route".into(),
+            enabled: true,
+            mixed_proxy_enabled: true,
+            mixed_proxy_port: 18080,
+            ..Default::default()
+        });
+        store.settings.download_lists_via_proxy = true;
+        store.settings.download_lists_via_proxy_section = "route".into();
+        let src = crate::store::OutboundSource::default();
+        let capture = |store: &crate::store::RouterStoreData, service| {
+            SubscriptionProxyContext::from_store(store, PathBuf::from("fixture.json"), service)
+        };
+        let before = capture(&store, Some(19090));
+        assert_eq!(before.ports_for(&src), (Some(18080), None));
+
+        store.sections[0].mixed_proxy_port = 18081;
+        assert_eq!(
+            capture(&store, Some(19090)).ports_for(&src),
+            (Some(18081), None)
+        );
+        store.sections[0].enabled = false;
+        assert_eq!(
+            capture(&store, Some(19090)).ports_for(&src),
+            (Some(19090), None)
+        );
+        store.settings.download_lists_via_proxy = false;
+        assert_eq!(
+            capture(&store, Some(19090)).ports_for(&src),
+            (None, Some(19090))
+        );
+        assert_eq!(
+            capture(&store, Some(19091)).ports_for(&src),
+            (None, Some(19091))
+        );
+
+        store.sections[0].enabled = true;
+        assert_eq!(capture(&store, None).ports_for(&src), (None, Some(18081)));
+        let direct_source = crate::store::OutboundSource {
+            download_via_proxy_enabled: true,
+            download_via_proxy_section: "route".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            capture(&store, Some(19090)).ports_for(&direct_source),
+            (Some(18081), None)
+        );
+    }
+
+    #[test]
+    fn test_subscription_request_unchanged_rejects_source_edits() {
+        let original = crate::store::OutboundSource {
+            id: "fixture".into(),
+            source_type: "subscription".into(),
+            enabled: true,
+            subscription_urls: vec!["https://example.invalid/a".into()],
+            ..Default::default()
+        };
+        assert!(subscription_request_unchanged(&original, &original));
+
+        let mut changed = original.clone();
+        changed.subscription_urls = vec!["https://example.invalid/b".into()];
+        assert!(!subscription_request_unchanged(&original, &changed));
+        changed = original.clone();
+        changed.hwid = "different".into();
+        assert!(!subscription_request_unchanged(&original, &changed));
+        changed = original.clone();
+        changed.user_agent = "different".into();
+        assert!(!subscription_request_unchanged(&original, &changed));
+        changed = original.clone();
+        changed.enabled = false;
+        assert!(!subscription_request_unchanged(&original, &changed));
+        changed = original.clone();
+        changed.download_via_proxy_section = "other".into();
+        assert!(!subscription_request_unchanged(&original, &changed));
+        changed = original.clone();
+        changed.subscription_insecure = true;
+        assert!(!subscription_request_unchanged(&original, &changed));
+        changed = original.clone();
+        changed.device_model = "different".into();
+        assert!(!subscription_request_unchanged(&original, &changed));
+        changed = original.clone();
+        changed.subscription_filter_exclude_keywords = vec!["other".into()];
+        assert!(!subscription_request_unchanged(&original, &changed));
+        changed = original.clone();
+        changed.id = "other".into();
+        assert!(!subscription_request_unchanged(&original, &changed));
+        changed = original.clone();
+        changed.source_type = "proxy_links".into();
+        assert!(!subscription_request_unchanged(&original, &changed));
+    }
+
+    #[test]
+    fn test_subscription_request_unchanged_ignores_response_telemetry() {
+        let original = crate::store::OutboundSource {
+            id: "fixture".into(),
+            source_type: "subscription".into(),
+            ..Default::default()
+        };
+        let mut updated = original.clone();
+        updated.sub_title = "new metadata".into();
+        updated.sub_upload_bytes = 12;
+        updated.sub_download_bytes = 34;
+        updated.sub_last_error = "old error".into();
+        updated.last_updated_unix = 123;
+        assert!(subscription_request_unchanged(&original, &updated));
+    }
 
     #[test]
     fn test_extract_semver_token_and_short_id_ignore() {

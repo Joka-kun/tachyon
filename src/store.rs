@@ -11037,18 +11037,12 @@ pub(crate) fn normalize_loaded_store_data(
 }
 
 fn write_store_json_if_changed(path: &Path, data: &RouterStoreData) -> anyhow::Result<bool> {
-    if crate::platform::is_entware() {
-        let raw = serde_json::to_vec_pretty(data)?;
-        let written = crate::platform::write_file_if_changed_durable(path, &raw)?;
-        #[cfg(unix)]
-        if written {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        }
-        Ok(written)
-    } else {
-        crypto_gen::write_json_if_changed(path, data)
+    let written = crypto_gen::write_json_if_changed(path, data)?;
+    #[cfg(unix)]
+    if written {
+        crate::platform::sync_parent_dir(path);
     }
+    Ok(written)
 }
 
 impl AppState {
@@ -11122,13 +11116,13 @@ impl AppState {
     /// Re-read and validate store JSON from disk (e.g. after an external edit via SSH/script).
     /// Preserves rejected file on error without silently rolling back to `known_good`.
     pub async fn reload_from_disk(&self) -> anyhow::Result<bool> {
+        // Serialize the disk read and any normalization write with transaction persistence.
+        let mut current = self.data.write().await;
         let raw = std::fs::read_to_string(&self.path)?;
         let (mut parsed, normalized) = match parse_store_from_str_tolerant(&raw) {
             Ok(res) => res,
             Err(e) => {
-                if let Ok(bytes) = std::fs::read(&self.path) {
-                    let _ = save_rejected_store_backup(&self.path, &bytes);
-                }
+                let _ = save_rejected_store_backup(&self.path, raw.as_bytes());
                 anyhow::bail!("Failed to parse {}: {e:#}", self.path.display());
             }
         };
@@ -11136,13 +11130,11 @@ impl AppState {
         if migrated {
             let _ = write_store_json_if_changed(&self.path, &parsed);
         }
-        {
-            let mut guard = self.data.write().await;
-            *guard = parsed;
-        }
+        *current = parsed;
         self.dirty.store(false, Ordering::Release);
         self.bump_generation();
         self.refresh_disk_fingerprint();
+        drop(current);
         self.live.write().await.push_event(
             "info",
             "store",
@@ -11154,7 +11146,13 @@ impl AppState {
     /// Save current configuration to disk only if bytes changed (NAND flash wear protection).
     pub async fn save(&self) -> anyhow::Result<bool> {
         let d = self.data.read().await;
-        let written = write_store_json_if_changed(&self.path, &d)?;
+        self.save_locked(&d)
+    }
+
+    /// Persist the current store while the caller holds its data lock.
+    /// Transactions use this to avoid releasing and reacquiring the lock.
+    pub(crate) fn save_locked(&self, data: &RouterStoreData) -> anyhow::Result<bool> {
+        let written = write_store_json_if_changed(&self.path, data)?;
         self.dirty.store(false, Ordering::Release);
         if written {
             self.bump_generation();
@@ -13970,6 +13968,66 @@ config outbound_source 'awg31_src'
             assert_eq!(d.settings.log_level, "debug");
         });
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_store_reload_reads_disk_after_pending_writer_finishes() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "tachyon-reload-order-{}-{}",
+            std::process::id(),
+            crate::crypto_gen::generate_hex(4)
+        ));
+        let state = AppState::load_or_create(tmp_dir.join("tachyon.json")).expect("init store");
+
+        let mut writer = state.data.write().await;
+        writer.settings.log_level = "debug".to_owned();
+        state.save_locked(&writer).expect("save first version");
+
+        let mut reload = std::pin::pin!(state.reload_from_disk());
+        poll_fn(|cx| {
+            assert!(reload.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        writer.settings.log_level = "warn".to_owned();
+        state.save_locked(&writer).expect("save newer version");
+        drop(writer);
+
+        assert!(reload.await.expect("reload"));
+        assert_eq!(state.data.read().await.settings.log_level, "warn");
+        assert!(!state.is_disk_modified_externally());
+        std::fs::remove_dir_all(tmp_dir).expect("clean test files");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_store_write_keeps_private_mode_and_skips_identical_replacement() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "tachyon-store-mode-{}-{}",
+            std::process::id(),
+            crate::crypto_gen::generate_hex(4)
+        ));
+        let path = tmp_dir.join("tachyon.json");
+        let mut config = RouterStoreData::default();
+        assert!(write_store_json_if_changed(&path, &config).expect("write store"));
+        let original = std::fs::metadata(&path).expect("read file metadata");
+        assert_eq!(original.mode() & 0o777, 0o600);
+        assert!(!write_store_json_if_changed(&path, &config).expect("save unchanged store"));
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), original.ino());
+
+        config.settings.log_level = "debug".into();
+        assert!(write_store_json_if_changed(&path, &config).expect("replace store"));
+        let actual: RouterStoreData =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).expect("read saved store");
+        assert_eq!(actual.settings.log_level, "debug");
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        std::fs::remove_dir_all(tmp_dir).expect("clean test files");
     }
 
     #[test]
