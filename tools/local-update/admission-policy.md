@@ -11,6 +11,10 @@ fails validation; it must be migrated locally before installing this candidate.
 Do not publish the real router store, its policy, profile files, or credentials.
 
 The bounded local qualification helper receives `TACHYON_ADMISSION_GLOBAL_AUTO`.
+The `checked_at` field records the last complete check. It advances when the
+helper exits successfully and every eligible candidate in a nonempty batch has
+an explicit `pass` or `reject` result. Partial runs still apply the individual
+results the helper wrote before it stopped.
 The helper and the existing admission state must be qualified together with this
 new contract before any deployment. The compiled candidate is not a trusted
 stable release. Run native build tests and router acceptance first.

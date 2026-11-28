@@ -33,6 +33,12 @@ on:
         type: choice
         options: [preview, stable]
         default: preview
+  pull_request:
+    branches: [local-release]
+    paths:
+      - '.github/workflows/tachyon-arm64.yml'
+      - 'patches/**'
+      - 'tools/local-update/**'
   push:
     branches: [local-release]
     paths:
@@ -47,11 +53,12 @@ concurrency:
 
 jobs:
   qualify:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       PATCH_SHA: c13a803147cd9bf06811258289da69ef8d7ecf66ac75b0dbd61ba22ea622fb8e
-      MODULE_SHA: 9f415d81c495c1d26f22509ef4cba2e67c2d41aaf345ae143b591087f99d828d
+      MODULE_SHA: af4db40c2e94c58260f612d470f7806385f3fa25cc24ebd403d6574f9d827c50
       CARGO_BUILD_JOBS: "3"
     steps:
       - name: Checkout reviewed patch set
@@ -59,7 +66,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-          ref: ${{ inputs.adapter_ref || github.sha }}
+          ref: ${{ inputs.adapter_ref || github.event.pull_request.head.sha || github.sha }}
       - name: Scan own history for privacy and secrets
         shell: bash
         run: python3 tools/local-update/privacy-scan.py history 6211109a28fbabda3153e482cb00c1bb70dfcae8 HEAD
@@ -76,17 +83,265 @@ jobs:
           printf 'ADAPTER_COMMIT=%s\n' "$adapter" >> "$GITHUB_ENV"
           printf '%s  %s\n' "$PATCH_SHA" patches/admission.patch "$MODULE_SHA" patches/provider_admission.rs | sha256sum -c -
           tag="$REQUESTED_TAG"
+          locked=tools/local-update/integration-lock.json
+          if [[ -f "$locked" ]]; then
+            jq -e '.schema == 1 and .status == "candidate_only" and .base.repository == "Dushnilin/tachyon" and .adapter.repository == "Joka-kun/tachyon" and (.fixes | length > 0) and (.fixes | map(.pr) | length == (unique | length)) and all(.fixes[]; (.pr | type == "number") and (.commit | test("^[0-9a-f]{40}$")))' "$locked" >/dev/null
+            locked_tag="$(jq -er .base.tag "$locked")"
+            locked_commit="$(jq -er .base.commit "$locked")"
+            [[ -z "$tag" || "$tag" == "$locked_tag" ]]
+            [[ -z "$EXPECTED_COMMIT" || "$EXPECTED_COMMIT" == "$locked_commit" ]]
+            [[ "$locked_commit" =~ ^[0-9a-f]{40}$ ]]
+            tag="$locked_tag"
+            EXPECTED_COMMIT="$locked_commit"
+          fi
           if [[ -z "$tag" ]]; then
             tag="$(curl --fail --silent --show-error --retry 3 'https://api.github.com/repos/Dushnilin/tachyon/releases?per_page=50' | python3 -c 'import json,sys; items=json.load(sys.stdin); print(next(r["tag_name"] for r in items if not r["draft"] and (sys.argv[1]=="preview" or not r["prerelease"])))' "$CHANNEL")"
           fi
           [[ "$tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo UNSUPPORTED_RELEASE_TAG_HOLD; exit 78; }
-          git clone --depth 1 --branch "$tag" https://github.com/Dushnilin/tachyon.git upstream
+          if [[ -f "$locked" ]]; then
+            git clone --single-branch --branch "$tag" https://github.com/Dushnilin/tachyon.git upstream
+          else
+            git clone --depth 1 --branch "$tag" https://github.com/Dushnilin/tachyon.git upstream
+          fi
           cd upstream
           commit="$(git rev-parse HEAD)"
           if [[ -n "$EXPECTED_COMMIT" ]]; then
             [[ "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
             test "$commit" = "$EXPECTED_COMMIT"
           fi
+          if [[ -f "../$locked" ]]; then
+            jq -r '.fixes[] | [.pr, .commit] | @tsv' "../$locked" > "$RUNNER_TEMP/tachyon-fix-heads"
+            while IFS=$'\t' read -r pr head; do
+              [[ "$pr" =~ ^[0-9]+$ && "$head" =~ ^[0-9a-f]{40}$ ]]
+              git fetch --no-tags https://github.com/Joka-kun/tachyon.git "$head"
+              test "$(git rev-parse FETCH_HEAD)" = "$head"
+              if ! git -c core.hooksPath=/dev/null -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' merge --no-ff --no-edit "$head"; then
+                # PRs 536 and 537 insert independent helpers and tests at the same anchors.
+                # This reviewed resolution is valid only for the exact three source blobs
+                # and the independently reconstructed result. No general conflict policy.
+                file=src/diagnostics.rs
+                if [[ "$pr" != 537 || "$head" != d3d923be6c059a4f738c9a57c206434d8c1cdaed || "$(git diff --name-only --diff-filter=U)" != "$file" ]]; then
+                  printf 'INTEGRATION_CONFLICT_HOLD PR=%s SHA=%s\n' "$pr" "$head"
+                  git diff --name-only --diff-filter=U
+                  exit 78
+                fi
+                [[ "$(git rev-parse ":1:$file")" == 9a06c7c16e2c126b0e535c867c5342159b64b62e ]]
+                [[ "$(git rev-parse ":2:$file")" == e78ad16a394c34d71d7bdf73d1cd329f4c3847b1 ]]
+                [[ "$(git rev-parse ":3:$file")" == 54ed2033b2ce890ada033cbdf0f7e9d40862ad4f ]]
+                # Exact patch derived from PR 537 against the RC6 + PR 536 blob.
+                git checkout --ours -- "$file"
+                cat > "$RUNNER_TEMP/diagnostics-reviewed.patch" <<'REVIEWED_DOCTOR_PATCH'
+          diff --git a/src/diagnostics.rs b/src/diagnostics.rs
+          --- a/src/diagnostics.rs
+          +++ b/src/diagnostics.rs
+          @@ -722,0 +723,35 @@
+          +/// Sum the cumulative counters for upstreams with a recent error. Core's
+          +/// last-seen timestamp also advances on failed queries.
+          +fn dns_upstream_error_total(servers: &[Value], now: i64) -> u64 {
+          +    const RECENT_ERROR_WINDOW_SECS: i64 = 10 * 60;
+          +
+          +    servers
+          +        .iter()
+          +        .map(|server| {
+          +            let total = server
+          +                .get("errors_total")
+          +                .and_then(Value::as_u64)
+          +                .unwrap_or(0);
+          +            if total == 0 {
+          +                return 0;
+          +            }
+          +
+          +            let Some(last_error) = server
+          +                .get("last_error_unix")
+          +                .and_then(Value::as_i64)
+          +                .filter(|timestamp| *timestamp > 0)
+          +            else {
+          +                // Older Core builds may not expose timestamps; preserve the
+          +                // previous cumulative-counter behavior for compatibility.
+          +                return total;
+          +            };
+          +
+          +            if last_error > now || now.saturating_sub(last_error) > RECENT_ERROR_WINDOW_SECS {
+          +                return 0;
+          +            }
+          +
+          +            total
+          +        })
+          +        .fold(0, u64::saturating_add)
+          +}
+          +
+          @@ -1108,5 +1143,1 @@
+          -        .map(|arr| {
+          -            arr.iter()
+          -                .map(|s| s.get("errors_total").and_then(Value::as_u64).unwrap_or(0))
+          -                .sum::<u64>()
+          -        })
+          +        .map(|arr| dns_upstream_error_total(arr, unix_now_secs()))
+          @@ -1114,1 +1145,2 @@
+          -    if dns_up_err >= 5 {
+          +    let dns_upstream_warning = dns_up_err >= 5;
+          +    if dns_upstream_warning {
+          @@ -1120,2 +1152,5 @@
+          -            detail: "Запросы к настроенным DNS-апстримам завершаются сбоем или SERVFAIL."
+          -                .to_string(),
+          +            detail: concat!(
+          +                "Учитываются накопительные счётчики апстримов с последней ошибкой за 10 минут. ",
+          +                "Если время ошибки недоступно, учитывается весь накопительный счётчик."
+          +            )
+          +            .to_string(),
+          @@ -2190,1 +2225,1 @@
+          -    } else if dns_up_err >= 5 || (fip_cap > 0 && fip_used * 100 / fip_cap >= 85) {
+          +    } else if dns_upstream_warning || (fip_cap > 0 && fip_used * 100 / fip_cap >= 85) {
+          @@ -8456,0 +8492,135 @@
+          +    #[test]
+          +    fn dns_upstream_errors_ignore_stale_cumulative_counters() {
+          +        let now = 1_000_000;
+          +        let servers = json!([
+          +            {
+          +                "errors_total": 9,
+          +                "last_error_unix": now - 2_964,
+          +                "last_seen_unix": now - 2_964
+          +            },
+          +            {
+          +                "errors_total": 2,
+          +                "last_error_unix": now - 110_664,
+          +                "last_seen_unix": now - 27
+          +            },
+          +            {
+          +                "errors_total": 0,
+          +                "last_error_unix": 0,
+          +                "last_seen_unix": now - 27
+          +            }
+          +        ]);
+          +
+          +        assert_eq!(
+          +            dns_upstream_error_total(servers.as_array().unwrap(), now),
+          +            0
+          +        );
+          +    }
+          +
+          +    #[test]
+          +    fn dns_upstream_errors_count_recent_failure_without_later_activity() {
+          +        let now = 1_000_000;
+          +        let servers = json!([{
+          +            "errors_total": 9,
+          +            "last_error_unix": now - 120,
+          +            "last_seen_unix": now - 120
+          +        }]);
+          +
+          +        assert_eq!(
+          +            dns_upstream_error_total(servers.as_array().unwrap(), now),
+          +            9
+          +        );
+          +    }
+          +
+          +    #[test]
+          +    fn dns_upstream_errors_keep_recent_failure_with_later_activity() {
+          +        let now = 1_000_000;
+          +        let last_error = now - 120;
+          +        // Core v0.6.6 advances last_seen_unix on both REFUSED and NOERROR,
+          +        // leaving last_error_unix and errors_total unchanged.
+          +        for (queries_total, last_seen) in [(6, last_error + 1), (7, last_error + 2)] {
+          +            let servers = [json!({
+          +                "queries_total": queries_total,
+          +                "errors_total": 5,
+          +                "servfail_total": 5,
+          +                "last_error_unix": last_error,
+          +                "last_seen_unix": last_seen,
+          +            })];
+          +            assert_eq!(dns_upstream_error_total(&servers, now), 5);
+          +        }
+          +    }
+          +
+          +    #[test]
+          +    fn dns_upstream_errors_respect_window_boundaries_across_servers() {
+          +        let now = 1_000_000;
+          +        let servers = [
+          +            json!({"errors_total": 2, "last_error_unix": now}),
+          +            json!({"errors_total": 3, "last_error_unix": now - 600}),
+          +            json!({"errors_total": 9, "last_error_unix": now - 601}),
+          +            json!({"errors_total": 9, "last_error_unix": now + 1}),
+          +        ];
+          +        assert_eq!(dns_upstream_error_total(&servers, now), 5);
+          +    }
+          +
+          +    #[test]
+          +    fn dns_upstream_errors_sum_cumulative_counters_without_overflow() {
+          +        let now = 1_000_000;
+          +        for total in [1, 2, 5] {
+          +            let servers = [json!({"errors_total": total, "last_error_unix": now})];
+          +            assert_eq!(dns_upstream_error_total(&servers, now), total);
+          +        }
+          +        let servers = [
+          +            json!({"errors_total": u64::MAX, "last_error_unix": now}),
+          +            json!({"errors_total": 1, "last_error_unix": now}),
+          +        ];
+          +        assert_eq!(dns_upstream_error_total(&servers, now), u64::MAX);
+          +    }
+          +
+          +    #[test]
+          +    fn dns_upstream_errors_keep_legacy_fallback_without_timestamps() {
+          +        let servers = [
+          +            json!({"errors_total": 2}),
+          +            json!({"errors_total": 1, "last_error_unix": 0}),
+          +            json!({"errors_total": 1, "last_error_unix": -1}),
+          +            json!({"errors_total": 1, "last_error_unix": null}),
+          +        ];
+          +        assert_eq!(dns_upstream_error_total(&servers, 1_000_000), 5);
+          +    }
+          +
+          +    #[test]
+          +    fn dns_upstream_errors_preserve_the_doctor_warning_threshold() {
+          +        let now = unix_now_secs();
+          +        let dir = std::env::temp_dir().join(format!("tachyon_diag_dns_{}", std::process::id()));
+          +        let state = AppState::load_or_create(dir.join("store.json")).unwrap();
+          +        let store = RouterStoreData::default();
+          +        let live = crate::store::LiveTelemetry {
+          +            core_running: true,
+          +            dns_healthy: true,
+          +            wan_healthy: true,
+          +            dns_upstream_errors: 9,
+          +            ..Default::default()
+          +        };
+          +        let report = |health| {
+          +            assemble_doctor_report(
+          +                &state, &store, &live, None, health, None, None, None, false, "", true,
+          +            )
+          +        };
+          +        for (total, expected_count) in [(4, None), (5, Some(5))] {
+          +            let result = report(Some(json!({"dns": {"servers": [
+          +                {"errors_total": total, "last_error_unix": now - 30, "last_seen_unix": now},
+          +                {"errors_total": 9, "last_error_unix": now - 601}
+          +            ]}})));
+          +            let count = result
+          +                .findings
+          +                .iter()
+          +                .find(|f| f.id == "dns_upstream_errors")
+          +                .and_then(|f| f.evidence["dns_upstream_errors"].as_u64());
+          +            assert_eq!(count, expected_count);
+          +        }
+          +        assert!(
+          +            report(None).findings.iter().any(|f| {
+          +                f.id == "dns_upstream_errors" && f.evidence["dns_upstream_errors"] == 9
+          +            })
+          +        );
+          +        std::fs::remove_dir_all(dir).unwrap();
+          +    }
+          +
+          REVIEWED_DOCTOR_PATCH
+                git apply --check --unidiff-zero "$RUNNER_TEMP/diagnostics-reviewed.patch"
+                git apply --unidiff-zero "$RUNNER_TEMP/diagnostics-reviewed.patch"
+                [[ "$(git hash-object "$file")" == 62ee528859cfb5815d06b4e1f8602ee7d1058c7e ]] || { echo REVIEWED_DIAGNOSTICS_RESULT_HOLD; exit 78; }
+                git add -- "$file"
+                test -z "$(git diff --name-only --diff-filter=U)"
+                git -c core.hooksPath=/dev/null -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit --no-edit
+                echo REVIEWED_DIAGNOSTICS_MERGE_PASS
+              fi
+              printf 'INTEGRATION_PR_%s=%s\n' "$pr" "$head"
+            done < "$RUNNER_TEMP/tachyon-fix-heads"
+            git diff --check "$commit" HEAD
+          fi
+          printf 'INTEGRATION_COMMIT=%s\nINTEGRATION_TREE=%s\n' "$(git rev-parse HEAD)" "$(git rev-parse HEAD^{tree})" >> "$GITHUB_ENV"
           test -f Cargo.lock
           test -f Cargo.toml
           lock="$(sha256sum Cargo.lock | cut -d' ' -f1)"
@@ -114,12 +369,17 @@ jobs:
           grep -Fq 'test provider_admission::tests::dns_failover_preserves_transport_identity ... ok' ../candidate/test.log
           grep -Fq 'test provider_admission::tests::changed_transport_cannot_inherit_a_name_and_global_stays_intact ... ok' ../candidate/test.log
           grep -Fq 'test provider_admission::tests::configured_admission_requires_valid_local_policy ... ok' ../candidate/test.log
+          if [[ -f ../tools/local-update/integration-lock.json ]]; then
+            RUST_MIN_STACK=524288 cargo +stable test --locked --offline --target aarch64-unknown-linux-gnu --all-targets
+            python3 tools/test_openwrt_pkg.py
+            python3 tools/test_openwrt_service_state.py
+          fi
       - name: Build ARM64 musl candidate
         shell: bash
         run: |
           set -euo pipefail
           cd upstream
-          TACHYON_BUILD_COMMIT="$UPSTREAM_COMMIT" cargo +stable build --release --locked --offline --target aarch64-unknown-linux-musl --bin tachyon
+          TACHYON_BUILD_COMMIT="$INTEGRATION_COMMIT" cargo +stable build --release --locked --offline --target aarch64-unknown-linux-musl --bin tachyon
           install -m 0755 target/aarch64-unknown-linux-musl/release/tachyon ../candidate/tachyon
           cd ../candidate
           LC_ALL=C readelf -h tachyon | tee elf.txt
@@ -130,6 +390,10 @@ jobs:
           rustc +stable -Vv > toolchain.txt
           printf 'status=CANDIDATE_NOT_DEPLOYABLE\nupstream_commit=%s\npatch_sha256=%s\nmodule_sha256=%s\nlock_sha256=%s\n' "$UPSTREAM_COMMIT" "$PATCH_SHA" "$MODULE_SHA" "$LOCK_SHA" > build-info.txt
           printf 'upstream_tag=%s\nadapter_commit=%s\n' "$UPSTREAM_TAG" "$ADAPTER_COMMIT" >> build-info.txt
+          printf 'integration_commit=%s\nintegration_tree=%s\n' "$INTEGRATION_COMMIT" "$INTEGRATION_TREE" >> build-info.txt
+          if [[ -f ../tools/local-update/integration-lock.json ]]; then
+            jq -r '.fixes[] | "upstream_pr_\(.pr)=\(.commit)"' ../tools/local-update/integration-lock.json >> build-info.txt
+          fi
           sha256sum tachyon > SHA256SUMS
       - name: Preserve corresponding source and evidence
         shell: bash
@@ -145,5 +409,121 @@ jobs:
         with:
           name: tachyon-arm64-candidate-${{ env.UPSTREAM_COMMIT }}-${{ env.ADAPTER_COMMIT }}
           path: candidate/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Setup Node.js for integrated OpenWrt package
+        if: hashFiles('tools/local-update/integration-lock.json') != ''
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: upstream/fe-app-tachyon/package-lock.json
+      - name: Validate integrated frontend and committed generated assets
+        if: hashFiles('tools/local-update/integration-lock.json') != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd upstream/fe-app-tachyon
+          npm ci
+          npm run locales:actualize
+          npm run ci
+          cd ..
+          if git diff -I "POT-Creation-Date" -I "PO-Revision-Date" --quiet -- fe-app-tachyon/locales luci-app-tachyon/po; then
+            git restore -- fe-app-tachyon/locales luci-app-tachyon/po
+          fi
+          git diff --exit-code -- fe-app-tachyon luci-app-tachyon
+      - name: Package exact ARM64 candidate using upstream packager
+        if: hashFiles('tools/local-update/integration-lock.json') != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir package-candidate
+          export SOURCE_DATE_EPOCH="$(git -C upstream show -s --format=%ct "$UPSTREAM_COMMIT")"
+          (cd candidate && sha256sum -c SHA256SUMS)
+          cd upstream
+          version="${UPSTREAM_TAG#v}"
+          python3 tools/build_openwrt_pkg.py \
+            --bin ../candidate/tachyon --arch aarch64 \
+            --target-triple aarch64-unknown-linux-musl --version "$version" \
+            --init openwrt/tachyon.init --hotplug openwrt/99-tachyon-wan-monitor \
+            --views-dir luci-app-tachyon/htdocs/luci-static/resources/view/tachyon \
+            --launcher-js openwrt/launcher.js \
+            --launcher-menu openwrt/tachyon-launcher.menu.json \
+            --launcher-acl openwrt/tachyon-launcher.acl.json \
+            --out-ipk ../package-candidate/tachyon-arm64-candidate.ipk \
+            --out-apk ../package-candidate/tachyon-arm64-candidate.apk
+          cd ..
+          python3 - <<'PY'
+          import hashlib, io, json, os, tarfile
+          from pathlib import Path, PurePosixPath
+          root = Path("package-candidate")
+          binary = Path("candidate/tachyon").read_bytes()
+          def files(archive, *, apk=False):
+              result = {}
+              for entry in archive:
+                  path = PurePosixPath(entry.name)
+                  assert not path.is_absolute() and ".." not in path.parts
+                  name = path.as_posix()
+                  if entry.isdir():
+                      continue
+                  assert entry.isfile() and name not in result, name
+                  content = archive.extractfile(entry).read()
+                  assert len(content) == entry.size
+                  result[name] = (content, entry.mode & 0o777)
+              return result
+          with tarfile.open(root / "tachyon-arm64-candidate.apk", "r:gz", ignore_zeros=True) as archive:
+              apk = files(archive)
+          with tarfile.open(root / "tachyon-arm64-candidate.ipk", "r:gz") as archive:
+              outer = files(archive)
+          assert set(outer) == {"debian-binary", "control.tar.gz", "data.tar.gz"}
+          with tarfile.open(fileobj=io.BytesIO(outer["data.tar.gz"][0]), mode="r:gz") as archive:
+              ipk = files(archive)
+          with tarfile.open(fileobj=io.BytesIO(outer["control.tar.gz"][0]), mode="r:gz") as archive:
+              control = files(archive)
+          apk_control = {name: apk.pop(name) for name in (
+              ".PKGINFO", ".pre-install", ".pre-upgrade", ".post-install", ".post-upgrade", ".pre-deinstall")}
+          assert set(control) == {"control", "preinst", "postinst", "prerm"}
+          assert apk == ipk, "APK and IPK payloads differ"
+          expected = {
+              "lib/upgrade/keep.d/tachyon", "usr/bin/tachyon", "etc/init.d/tachyon",
+              "www/cgi-bin/tachyon-sub", "etc/hotplug.d/iface/99-tachyon-wan-monitor",
+              "usr/share/luci/menu.d/tachyon-launcher.json",
+              "usr/share/rpcd/acl.d/tachyon-launcher.json",
+          }
+          prefix = "www/luci-static/resources/view/tachyon/"
+          assert expected <= set(apk) and prefix + "main.js" in apk
+          assert all(name in expected or name.startswith(prefix) for name in apk)
+          assert apk["usr/bin/tachyon"] == (binary, 0o755)
+          bundle = Path("upstream/luci-app-tachyon/htdocs/luci-static/resources/view/tachyon/main.js").read_bytes()
+          assert apk[prefix + "main.js"][0] == bundle
+          assert b"PKG_UPGRADE" in apk_control[".post-upgrade"][0]
+          assert b"/etc/init.d/tachyon enabled" in apk_control[".post-upgrade"][0]
+          assert b"Package: tachyon\n" in control["control"][0]
+          assert b"pkgname = tachyon\n" in apk_control[".PKGINFO"][0]
+          report = {
+              "schema": 1, "status": "UNSIGNED_CANDIDATE_NOT_DEPLOYABLE",
+              "source_commit": os.environ["INTEGRATION_COMMIT"],
+              "source_tree_before_adapter": os.environ["INTEGRATION_TREE"],
+              "adapter_commit": os.environ["ADAPTER_COMMIT"],
+              "binary_sha256": hashlib.sha256(binary).hexdigest(),
+              "package_version_policy": "upstream version for isolated qualification only; release revision and signing remain separate",
+              "apk_ipk_payload_equal": True,
+              "payload": [{"path": name, "bytes": len(data), "mode": format(mode, "04o"),
+                           "sha256": hashlib.sha256(data).hexdigest()}
+                          for name, (data, mode) in sorted(apk.items())],
+              "private_configuration_included": False,
+              "native_installation": "HOLD",
+          }
+          (root / "package-inventory.json").write_text(json.dumps(report, indent=2) + "\n")
+          print("OPENWRT_CANDIDATE_PACKAGE_CONTENTS_PASS", len(apk))
+          PY
+          cp candidate/build-info.txt package-candidate/
+          (cd package-candidate && sha256sum tachyon-arm64-candidate.apk tachyon-arm64-candidate.ipk package-inventory.json build-info.txt > SHA256SUMS)
+      - name: Upload unsigned OpenWrt package candidate
+        if: hashFiles('tools/local-update/integration-lock.json') != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tachyon-openwrt-arm64-package-${{ env.UPSTREAM_COMMIT }}-${{ env.ADAPTER_COMMIT }}
+          path: package-candidate/
           if-no-files-found: error
           retention-days: 14
