@@ -901,6 +901,62 @@ mod tests {
     use crate::store::{InboundServer, OutboundSource};
 
     #[tokio::test]
+    async fn test_guarded_transaction_commits_current_candidate() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "tachyon_tx_current_{}_{}",
+            std::process::id(),
+            crate::crypto_gen::generate_hex(4)
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("mkdir");
+        let store_path = tmp_dir.join("store.json");
+        let core_path = tmp_dir.join("tachyon-core-config.json");
+        let state = AppState::load_or_create(&store_path).expect("load store");
+        let (expected, mut candidate) = {
+            let current = state.data.read().await;
+            (
+                ExpectedStore::capture(&state, &current).expect("capture"),
+                clone_store_boxed(&current),
+            )
+        };
+        let original_label = candidate.sections[0].label.clone();
+        let generation = state.store_generation();
+        candidate.settings.core_config_path = core_path.to_string_lossy().into_owned();
+        candidate.settings.tun_inet4 = "172.19.0.1/30".into();
+        candidate.settings.fakeip_inet4_range = "198.18.0.0/15".into();
+        candidate.settings.tun_inet6 = "fdfe:dcba:9876::1/126".into();
+        candidate.settings.fakeip_inet6_range = "fc00::/18".into();
+        candidate.sections[0].label = "guarded candidate".into();
+        let report = commit_transaction_checked(
+            &state,
+            candidate,
+            "subscription",
+            Some(tmp_dir.join("history")),
+            Some(expected),
+        )
+        .await
+        .expect("current candidate commits");
+        assert!(report.valid);
+        assert!(state.store_generation() > generation);
+        assert_eq!(
+            state.data.read().await.sections[0].label,
+            "guarded candidate"
+        );
+        let persisted = AppState::load_or_create(&store_path).expect("reload committed store");
+        assert_eq!(
+            persisted.data.read().await.sections[0].label,
+            "guarded candidate"
+        );
+        let known_good: RouterStoreData =
+            serde_json::from_slice(&std::fs::read(&state.lkg_path).expect("read LKG"))
+                .expect("parse LKG");
+        assert_eq!(known_good.sections[0].label, original_label);
+        let core: Value = serde_json::from_slice(&std::fs::read(&core_path).expect("read core"))
+            .expect("parse compiled core");
+        assert!(core.is_object());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
     async fn test_guarded_transaction_rejects_stale_store_without_writing() {
         let tmp_dir = std::env::temp_dir().join(format!(
             "tachyon_tx_stale_{}_{}",
