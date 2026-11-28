@@ -696,7 +696,11 @@ impl ExpectedStore {
         })
     }
 
-    pub(crate) fn ensure_current(&self, state: &AppState, data: &RouterStoreData) -> anyhow::Result<()> {
+    pub(crate) fn ensure_current(
+        &self,
+        state: &AppState,
+        data: &RouterStoreData,
+    ) -> anyhow::Result<()> {
         if self.generation != state.store_generation() || self.data != serde_json::to_value(data)? {
             anyhow::bail!("Transaction conflict: store changed while preparing candidate");
         }
@@ -963,7 +967,8 @@ mod tests {
         {
             let mut current = state.data.write().await;
             current.sections[0].label = "late edit".into();
-            let result = swap_candidate_if_current(&state, &mut current, candidate, Some(&expected));
+            let result =
+                swap_candidate_if_current(&state, &mut current, candidate, Some(&expected));
             assert!(result.is_err());
             assert_eq!(current.sections[0].label, "late edit");
         }
