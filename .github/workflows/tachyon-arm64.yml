@@ -128,12 +128,210 @@ jobs:
                 [[ "$(git rev-parse ":1:$file")" == 9a06c7c16e2c126b0e535c867c5342159b64b62e ]]
                 [[ "$(git rev-parse ":2:$file")" == e78ad16a394c34d71d7bdf73d1cd329f4c3847b1 ]]
                 [[ "$(git rev-parse ":3:$file")" == 54ed2033b2ce890ada033cbdf0f7e9d40862ad4f ]]
-                for stage in 1 2 3; do
-                  git show ":$stage:$file" > "$RUNNER_TEMP/diagnostics-stage-$stage.rs"
-                done
-                git merge-file --union -p "$RUNNER_TEMP/diagnostics-stage-2.rs" "$RUNNER_TEMP/diagnostics-stage-1.rs" "$RUNNER_TEMP/diagnostics-stage-3.rs" > "$RUNNER_TEMP/diagnostics-reviewed.rs"
-                [[ "$(git hash-object "$RUNNER_TEMP/diagnostics-reviewed.rs")" == 62ee528859cfb5815d06b4e1f8602ee7d1058c7e ]] || { echo REVIEWED_DIAGNOSTICS_RESULT_HOLD; exit 78; }
-                cp "$RUNNER_TEMP/diagnostics-reviewed.rs" "$file"
+                # Exact patch derived from PR 537 against the RC6 + PR 536 blob.
+                git checkout --ours -- "$file"
+                cat > "$RUNNER_TEMP/diagnostics-reviewed.patch" <<'REVIEWED_DOCTOR_PATCH'
+          diff --git a/src/diagnostics.rs b/src/diagnostics.rs
+          --- a/src/diagnostics.rs
+          +++ b/src/diagnostics.rs
+          @@ -722,0 +723,35 @@
+          +/// Sum the cumulative counters for upstreams with a recent error. Core's
+          +/// last-seen timestamp also advances on failed queries.
+          +fn dns_upstream_error_total(servers: &[Value], now: i64) -> u64 {
+          +    const RECENT_ERROR_WINDOW_SECS: i64 = 10 * 60;
+          +
+          +    servers
+          +        .iter()
+          +        .map(|server| {
+          +            let total = server
+          +                .get("errors_total")
+          +                .and_then(Value::as_u64)
+          +                .unwrap_or(0);
+          +            if total == 0 {
+          +                return 0;
+          +            }
+          +
+          +            let Some(last_error) = server
+          +                .get("last_error_unix")
+          +                .and_then(Value::as_i64)
+          +                .filter(|timestamp| *timestamp > 0)
+          +            else {
+          +                // Older Core builds may not expose timestamps; preserve the
+          +                // previous cumulative-counter behavior for compatibility.
+          +                return total;
+          +            };
+          +
+          +            if last_error > now || now.saturating_sub(last_error) > RECENT_ERROR_WINDOW_SECS {
+          +                return 0;
+          +            }
+          +
+          +            total
+          +        })
+          +        .fold(0, u64::saturating_add)
+          +}
+          +
+          @@ -1108,5 +1143,1 @@
+          -        .map(|arr| {
+          -            arr.iter()
+          -                .map(|s| s.get("errors_total").and_then(Value::as_u64).unwrap_or(0))
+          -                .sum::<u64>()
+          -        })
+          +        .map(|arr| dns_upstream_error_total(arr, unix_now_secs()))
+          @@ -1114,1 +1145,2 @@
+          -    if dns_up_err >= 5 {
+          +    let dns_upstream_warning = dns_up_err >= 5;
+          +    if dns_upstream_warning {
+          @@ -1120,2 +1152,5 @@
+          -            detail: "Запросы к настроенным DNS-апстримам завершаются сбоем или SERVFAIL."
+          -                .to_string(),
+          +            detail: concat!(
+          +                "Учитываются накопительные счётчики апстримов с последней ошибкой за 10 минут. ",
+          +                "Если время ошибки недоступно, учитывается весь накопительный счётчик."
+          +            )
+          +            .to_string(),
+          @@ -2190,1 +2225,1 @@
+          -    } else if dns_up_err >= 5 || (fip_cap > 0 && fip_used * 100 / fip_cap >= 85) {
+          +    } else if dns_upstream_warning || (fip_cap > 0 && fip_used * 100 / fip_cap >= 85) {
+          @@ -8456,0 +8492,135 @@
+          +    #[test]
+          +    fn dns_upstream_errors_ignore_stale_cumulative_counters() {
+          +        let now = 1_000_000;
+          +        let servers = json!([
+          +            {
+          +                "errors_total": 9,
+          +                "last_error_unix": now - 2_964,
+          +                "last_seen_unix": now - 2_964
+          +            },
+          +            {
+          +                "errors_total": 2,
+          +                "last_error_unix": now - 110_664,
+          +                "last_seen_unix": now - 27
+          +            },
+          +            {
+          +                "errors_total": 0,
+          +                "last_error_unix": 0,
+          +                "last_seen_unix": now - 27
+          +            }
+          +        ]);
+          +
+          +        assert_eq!(
+          +            dns_upstream_error_total(servers.as_array().unwrap(), now),
+          +            0
+          +        );
+          +    }
+          +
+          +    #[test]
+          +    fn dns_upstream_errors_count_recent_failure_without_later_activity() {
+          +        let now = 1_000_000;
+          +        let servers = json!([{
+          +            "errors_total": 9,
+          +            "last_error_unix": now - 120,
+          +            "last_seen_unix": now - 120
+          +        }]);
+          +
+          +        assert_eq!(
+          +            dns_upstream_error_total(servers.as_array().unwrap(), now),
+          +            9
+          +        );
+          +    }
+          +
+          +    #[test]
+          +    fn dns_upstream_errors_keep_recent_failure_with_later_activity() {
+          +        let now = 1_000_000;
+          +        let last_error = now - 120;
+          +        // Core v0.6.6 advances last_seen_unix on both REFUSED and NOERROR,
+          +        // leaving last_error_unix and errors_total unchanged.
+          +        for (queries_total, last_seen) in [(6, last_error + 1), (7, last_error + 2)] {
+          +            let servers = [json!({
+          +                "queries_total": queries_total,
+          +                "errors_total": 5,
+          +                "servfail_total": 5,
+          +                "last_error_unix": last_error,
+          +                "last_seen_unix": last_seen,
+          +            })];
+          +            assert_eq!(dns_upstream_error_total(&servers, now), 5);
+          +        }
+          +    }
+          +
+          +    #[test]
+          +    fn dns_upstream_errors_respect_window_boundaries_across_servers() {
+          +        let now = 1_000_000;
+          +        let servers = [
+          +            json!({"errors_total": 2, "last_error_unix": now}),
+          +            json!({"errors_total": 3, "last_error_unix": now - 600}),
+          +            json!({"errors_total": 9, "last_error_unix": now - 601}),
+          +            json!({"errors_total": 9, "last_error_unix": now + 1}),
+          +        ];
+          +        assert_eq!(dns_upstream_error_total(&servers, now), 5);
+          +    }
+          +
+          +    #[test]
+          +    fn dns_upstream_errors_sum_cumulative_counters_without_overflow() {
+          +        let now = 1_000_000;
+          +        for total in [1, 2, 5] {
+          +            let servers = [json!({"errors_total": total, "last_error_unix": now})];
+          +            assert_eq!(dns_upstream_error_total(&servers, now), total);
+          +        }
+          +        let servers = [
+          +            json!({"errors_total": u64::MAX, "last_error_unix": now}),
+          +            json!({"errors_total": 1, "last_error_unix": now}),
+          +        ];
+          +        assert_eq!(dns_upstream_error_total(&servers, now), u64::MAX);
+          +    }
+          +
+          +    #[test]
+          +    fn dns_upstream_errors_keep_legacy_fallback_without_timestamps() {
+          +        let servers = [
+          +            json!({"errors_total": 2}),
+          +            json!({"errors_total": 1, "last_error_unix": 0}),
+          +            json!({"errors_total": 1, "last_error_unix": -1}),
+          +            json!({"errors_total": 1, "last_error_unix": null}),
+          +        ];
+          +        assert_eq!(dns_upstream_error_total(&servers, 1_000_000), 5);
+          +    }
+          +
+          +    #[test]
+          +    fn dns_upstream_errors_preserve_the_doctor_warning_threshold() {
+          +        let now = unix_now_secs();
+          +        let dir = std::env::temp_dir().join(format!("tachyon_diag_dns_{}", std::process::id()));
+          +        let state = AppState::load_or_create(dir.join("store.json")).unwrap();
+          +        let store = RouterStoreData::default();
+          +        let live = crate::store::LiveTelemetry {
+          +            core_running: true,
+          +            dns_healthy: true,
+          +            wan_healthy: true,
+          +            dns_upstream_errors: 9,
+          +            ..Default::default()
+          +        };
+          +        let report = |health| {
+          +            assemble_doctor_report(
+          +                &state, &store, &live, None, health, None, None, None, false, "", true,
+          +            )
+          +        };
+          +        for (total, expected_count) in [(4, None), (5, Some(5))] {
+          +            let result = report(Some(json!({"dns": {"servers": [
+          +                {"errors_total": total, "last_error_unix": now - 30, "last_seen_unix": now},
+          +                {"errors_total": 9, "last_error_unix": now - 601}
+          +            ]}})));
+          +            let count = result
+          +                .findings
+          +                .iter()
+          +                .find(|f| f.id == "dns_upstream_errors")
+          +                .and_then(|f| f.evidence["dns_upstream_errors"].as_u64());
+          +            assert_eq!(count, expected_count);
+          +        }
+          +        assert!(
+          +            report(None).findings.iter().any(|f| {
+          +                f.id == "dns_upstream_errors" && f.evidence["dns_upstream_errors"] == 9
+          +            })
+          +        );
+          +        std::fs::remove_dir_all(dir).unwrap();
+          +    }
+          +
+          REVIEWED_DOCTOR_PATCH
+                git apply --check --unidiff-zero "$RUNNER_TEMP/diagnostics-reviewed.patch"
+                git apply --unidiff-zero "$RUNNER_TEMP/diagnostics-reviewed.patch"
+                [[ "$(git hash-object "$file")" == 62ee528859cfb5815d06b4e1f8602ee7d1058c7e ]] || { echo REVIEWED_DIAGNOSTICS_RESULT_HOLD; exit 78; }
                 git add -- "$file"
                 test -z "$(git diff --name-only --diff-filter=U)"
                 git -c core.hooksPath=/dev/null -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit --no-edit
