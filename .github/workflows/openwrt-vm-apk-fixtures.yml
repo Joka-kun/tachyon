@@ -1,0 +1,64 @@
+name: OpenWrt VM APK fixtures
+
+on:
+  push:
+    branches: [codex/openwrt-vm-apk-fixtures]
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Prepare published baseline and candidate APK
+        env:
+          PACKAGER_SOURCE: f73a7b5c89e67a853c8cfe77218c5794f3b9c5f7
+          BASELINE_SHA256: 39e84b716eea24987e4e5a82b8b2fb923521702df8f09d1fe063d033353c0e94
+          SOURCE_DATE_EPOCH: '1795737600'
+        run: |
+          set -euo pipefail
+          git diff --quiet "$PACKAGER_SOURCE" HEAD -- tools/build_openwrt_pkg.py
+          mkdir -p fixtures
+          curl --fail --location --proto '=https' --retry 2 --silent --show-error \
+            https://github.com/Dushnilin/tachyon/releases/download/v2.0.0-rc.5/tachyon-x86_64-v2.0.0-rc.5.apk \
+            -o fixtures/baseline.apk
+          printf '%s  %s\n' "$BASELINE_SHA256" fixtures/baseline.apk | sha256sum -c -
+          PYTHONPATH=tools python3 - <<'PY'
+          import os
+          import tarfile
+          from build_openwrt_pkg import build_apk
+
+          files = []
+          dirs = []
+          with tarfile.open("fixtures/baseline.apk", "r:gz") as package:
+              for entry in package:
+                  if entry.name.startswith("."):
+                      continue
+                  if entry.isdir():
+                      dirs.append(entry.name)
+                  elif entry.isfile():
+                      with package.extractfile(entry) as content:
+                          files.append((entry.name, content.read(), entry.mode))
+                  else:
+                      raise SystemExit(f"unexpected APK entry: {entry.name}")
+          assert any(path == "usr/bin/tachyon" and content.startswith(b"\x7fELF")
+                     for path, content, _ in files)
+          build_apk(
+              "fixtures/candidate.apk", "2.0.0-rc.6", "x86_64",
+              files, dirs, sum(len(content) for _, content, _ in files),
+              int(os.environ["SOURCE_DATE_EPOCH"]),
+          )
+          PY
+          (cd fixtures && sha256sum baseline.apk candidate.apk > SHA256SUMS)
+          printf '%s\n' "$PACKAGER_SOURCE" > fixtures/packager-source.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-vm-apks
+          path: fixtures/
+          if-no-files-found: error
+          retention-days: 7
