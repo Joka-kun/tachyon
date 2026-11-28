@@ -954,7 +954,7 @@ mod tests {
             crate::crypto_gen::generate_hex(4)
         ));
         std::fs::create_dir_all(&tmp_dir).expect("mkdir");
-        let state = AppState::load_or_create(&tmp_dir.join("store.json")).expect("load store");
+        let state = AppState::load_or_create(tmp_dir.join("store.json")).expect("load store");
         let (expected, mut candidate) = {
             let data = state.data.read().await;
             let expected = ExpectedStore::capture(&state, &data).expect("capture");
@@ -984,7 +984,7 @@ mod tests {
             crate::crypto_gen::generate_hex(4)
         ));
         std::fs::create_dir_all(&tmp_dir).expect("mkdir");
-        let state = AppState::load_or_create(&tmp_dir.join("store.json")).expect("load store");
+        let state = AppState::load_or_create(tmp_dir.join("store.json")).expect("load store");
         {
             let data = state.data.read().await;
             let expected = ExpectedStore::capture(&state, &data).expect("capture");
