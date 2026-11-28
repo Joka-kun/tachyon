@@ -411,3 +411,119 @@ jobs:
           path: candidate/
           if-no-files-found: error
           retention-days: 14
+      - name: Setup Node.js for integrated OpenWrt package
+        if: hashFiles('tools/local-update/integration-lock.json') != ''
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: upstream/fe-app-tachyon/package-lock.json
+      - name: Validate integrated frontend and committed generated assets
+        if: hashFiles('tools/local-update/integration-lock.json') != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd upstream/fe-app-tachyon
+          npm ci
+          npm run locales:actualize
+          npm run ci
+          cd ..
+          if git diff -I "POT-Creation-Date" -I "PO-Revision-Date" --quiet -- fe-app-tachyon/locales luci-app-tachyon/po; then
+            git restore -- fe-app-tachyon/locales luci-app-tachyon/po
+          fi
+          git diff --exit-code -- fe-app-tachyon luci-app-tachyon
+      - name: Package exact ARM64 candidate using upstream packager
+        if: hashFiles('tools/local-update/integration-lock.json') != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir package-candidate
+          export SOURCE_DATE_EPOCH="$(git -C upstream show -s --format=%ct "$UPSTREAM_COMMIT")"
+          (cd candidate && sha256sum -c SHA256SUMS)
+          cd upstream
+          version="${UPSTREAM_TAG#v}"
+          python3 tools/build_openwrt_pkg.py \
+            --bin ../candidate/tachyon --arch aarch64 \
+            --target-triple aarch64-unknown-linux-musl --version "$version" \
+            --init openwrt/tachyon.init --hotplug openwrt/99-tachyon-wan-monitor \
+            --views-dir luci-app-tachyon/htdocs/luci-static/resources/view/tachyon \
+            --launcher-js openwrt/launcher.js \
+            --launcher-menu openwrt/tachyon-launcher.menu.json \
+            --launcher-acl openwrt/tachyon-launcher.acl.json \
+            --out-ipk ../package-candidate/tachyon-arm64-candidate.ipk \
+            --out-apk ../package-candidate/tachyon-arm64-candidate.apk
+          cd ..
+          python3 - <<'PY'
+          import hashlib, io, json, os, tarfile
+          from pathlib import Path, PurePosixPath
+          root = Path("package-candidate")
+          binary = Path("candidate/tachyon").read_bytes()
+          def files(archive, *, apk=False):
+              result = {}
+              for entry in archive:
+                  path = PurePosixPath(entry.name)
+                  assert not path.is_absolute() and ".." not in path.parts
+                  name = path.as_posix()
+                  if entry.isdir():
+                      continue
+                  assert entry.isfile() and name not in result, name
+                  content = archive.extractfile(entry).read()
+                  assert len(content) == entry.size
+                  result[name] = (content, entry.mode & 0o777)
+              return result
+          with tarfile.open(root / "tachyon-arm64-candidate.apk", "r:gz", ignore_zeros=True) as archive:
+              apk = files(archive)
+          with tarfile.open(root / "tachyon-arm64-candidate.ipk", "r:gz") as archive:
+              outer = files(archive)
+          assert set(outer) == {"debian-binary", "control.tar.gz", "data.tar.gz"}
+          with tarfile.open(fileobj=io.BytesIO(outer["data.tar.gz"][0]), mode="r:gz") as archive:
+              ipk = files(archive)
+          with tarfile.open(fileobj=io.BytesIO(outer["control.tar.gz"][0]), mode="r:gz") as archive:
+              control = files(archive)
+          apk_control = {name: apk.pop(name) for name in (
+              ".PKGINFO", ".pre-install", ".pre-upgrade", ".post-install", ".post-upgrade", ".pre-deinstall")}
+          assert set(control) == {"control", "preinst", "postinst", "prerm"}
+          assert apk == ipk, "APK and IPK payloads differ"
+          expected = {
+              "lib/upgrade/keep.d/tachyon", "usr/bin/tachyon", "etc/init.d/tachyon",
+              "www/cgi-bin/tachyon-sub", "etc/hotplug.d/iface/99-tachyon-wan-monitor",
+              "usr/share/luci/menu.d/tachyon-launcher.json",
+              "usr/share/rpcd/acl.d/tachyon-launcher.json",
+          }
+          prefix = "www/luci-static/resources/view/tachyon/"
+          assert expected <= set(apk) and prefix + "main.js" in apk
+          assert all(name in expected or name.startswith(prefix) for name in apk)
+          assert apk["usr/bin/tachyon"] == (binary, 0o755)
+          bundle = Path("upstream/luci-app-tachyon/htdocs/luci-static/resources/view/tachyon/main.js").read_bytes()
+          assert apk[prefix + "main.js"][0] == bundle
+          assert b"PKG_UPGRADE" in apk_control[".post-upgrade"][0]
+          assert b"/etc/init.d/tachyon enabled" in apk_control[".post-upgrade"][0]
+          assert b"Package: tachyon\n" in control["control"][0]
+          assert b"pkgname = tachyon\n" in apk_control[".PKGINFO"][0]
+          report = {
+              "schema": 1, "status": "UNSIGNED_CANDIDATE_NOT_DEPLOYABLE",
+              "source_commit": os.environ["INTEGRATION_COMMIT"],
+              "source_tree_before_adapter": os.environ["INTEGRATION_TREE"],
+              "adapter_commit": os.environ["ADAPTER_COMMIT"],
+              "binary_sha256": hashlib.sha256(binary).hexdigest(),
+              "package_version_policy": "upstream version for isolated qualification only; release revision and signing remain separate",
+              "apk_ipk_payload_equal": True,
+              "payload": [{"path": name, "bytes": len(data), "mode": format(mode, "04o"),
+                           "sha256": hashlib.sha256(data).hexdigest()}
+                          for name, (data, mode) in sorted(apk.items())],
+              "private_configuration_included": False,
+              "native_installation": "HOLD",
+          }
+          (root / "package-inventory.json").write_text(json.dumps(report, indent=2) + "\n")
+          print("OPENWRT_CANDIDATE_PACKAGE_CONTENTS_PASS", len(apk))
+          PY
+          cp candidate/build-info.txt package-candidate/
+          (cd package-candidate && sha256sum tachyon-arm64-candidate.apk tachyon-arm64-candidate.ipk package-inventory.json build-info.txt > SHA256SUMS)
+      - name: Upload unsigned OpenWrt package candidate
+        if: hashFiles('tools/local-update/integration-lock.json') != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tachyon-openwrt-arm64-package-${{ env.UPSTREAM_COMMIT }}-${{ env.ADAPTER_COMMIT }}
+          path: package-candidate/
+          if-no-files-found: error
+          retention-days: 14
