@@ -2586,10 +2586,17 @@ fn discover_torrserver_cgroupv2() -> Option<(usize, String)> {
 fn torrserver_direct_rules_drift(listing: &serde_json::Value, expected: &str) -> Option<bool> {
     let entries = listing.get("nftables")?.as_array()?;
     if !entries.iter().any(|entry| {
-        entry.pointer("/chain/family").and_then(serde_json::Value::as_str) == Some("inet")
-            && entry.pointer("/chain/table").and_then(serde_json::Value::as_str)
+        entry
+            .pointer("/chain/family")
+            .and_then(serde_json::Value::as_str)
+            == Some("inet")
+            && entry
+                .pointer("/chain/table")
+                .and_then(serde_json::Value::as_str)
                 == Some("TachyonTable")
-            && entry.pointer("/chain/name").and_then(serde_json::Value::as_str)
+            && entry
+                .pointer("/chain/name")
+                .and_then(serde_json::Value::as_str)
                 == Some("mangle_output")
     }) {
         return None;
@@ -2605,7 +2612,9 @@ fn torrserver_direct_rules_drift(listing: &serde_json::Value, expected: &str) ->
         }
         let mut matches = 0;
         for expr in rule.get("expr")?.as_array()? {
-            if expr.pointer("/match/left/socket/key").and_then(serde_json::Value::as_str)
+            if expr
+                .pointer("/match/left/socket/key")
+                .and_then(serde_json::Value::as_str)
                 != Some("cgroupv2")
             {
                 continue;
@@ -2627,10 +2636,18 @@ pub(crate) async fn torrserver_cgroup_drift() -> Option<bool> {
         .await
         .ok()??;
     let mut cmd = Command::new("nft");
-    cmd.args(["-j", "-nn", "list", "chain", "inet", "TachyonTable", "mangle_output"])
-        .kill_on_drop(true)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+    cmd.args([
+        "-j",
+        "-nn",
+        "list",
+        "chain",
+        "inet",
+        "TachyonTable",
+        "mangle_output",
+    ])
+    .kill_on_drop(true)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
     let out = tokio::time::timeout(Duration::from_secs(5), cmd.output())
         .await
         .ok()?
