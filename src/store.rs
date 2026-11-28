@@ -11037,18 +11037,12 @@ pub(crate) fn normalize_loaded_store_data(
 }
 
 fn write_store_json_if_changed(path: &Path, data: &RouterStoreData) -> anyhow::Result<bool> {
-    if crate::platform::is_entware() {
-        let raw = serde_json::to_vec_pretty(data)?;
-        let written = crate::platform::write_file_if_changed_durable(path, &raw)?;
-        #[cfg(unix)]
-        if written {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        }
-        Ok(written)
-    } else {
-        crypto_gen::write_json_if_changed(path, data)
+    let written = crypto_gen::write_json_if_changed(path, data)?;
+    #[cfg(unix)]
+    if written {
+        crate::platform::sync_parent_dir(path);
     }
+    Ok(written)
 }
 
 impl AppState {
@@ -14006,6 +14000,33 @@ config outbound_source 'awg31_src'
         assert!(reload.await.expect("reload"));
         assert_eq!(state.data.read().await.settings.log_level, "warn");
         assert!(!state.is_disk_modified_externally());
+        std::fs::remove_dir_all(tmp_dir).expect("clean test files");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_store_write_keeps_private_mode_and_skips_identical_replacement() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "tachyon-store-mode-{}-{}",
+            std::process::id(),
+            crate::crypto_gen::generate_hex(4)
+        ));
+        let path = tmp_dir.join("tachyon.json");
+        let mut config = RouterStoreData::default();
+        assert!(write_store_json_if_changed(&path, &config).expect("write store"));
+        let original = std::fs::metadata(&path).expect("read file metadata");
+        assert_eq!(original.mode() & 0o777, 0o600);
+        assert!(!write_store_json_if_changed(&path, &config).expect("save unchanged store"));
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), original.ino());
+
+        config.settings.log_level = "debug".into();
+        assert!(write_store_json_if_changed(&path, &config).expect("replace store"));
+        let actual: RouterStoreData =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).expect("read saved store");
+        assert_eq!(actual.settings.log_level, "debug");
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
         std::fs::remove_dir_all(tmp_dir).expect("clean test files");
     }
 
