@@ -1498,9 +1498,8 @@ pub async fn check_and_repair_nft_drift(
         }
         let result = Box::pin(net_stack::reconcile_network_stack(&store_snapshot)).await;
         let restored = net_stack::check_nft_table_active().await;
-        let repaired = result.is_ok()
-            && restored
-            && net_stack::torrserver_cgroup_drift().await == Some(false);
+        let repaired =
+            result.is_ok() && restored && net_stack::torrserver_cgroup_drift().await == Some(false);
         let mut live = state.live.write().await;
         live.nft_table_active = restored;
         let msg = if repaired {
