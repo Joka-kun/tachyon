@@ -5083,7 +5083,13 @@ impl CoreManager {
 
         // Re-read fresh state right before committing so concurrent config edits are preserved.
         let finish_ts = unix_now_secs().max(now);
-        let mut candidate = self.state.data.read().await.clone();
+        let (expected, mut candidate) = {
+            let current = self.state.data.read().await;
+            (
+                transaction::ExpectedStore::capture(&self.state, &current)?,
+                current.clone(),
+            )
+        };
         let mut updated_sources = 0usize;
         let mut persist_needed = false;
         let mut core_reload_needed = false;
@@ -5171,19 +5177,14 @@ impl CoreManager {
             ));
         }
 
-        // A discarded response must not delay the next refresh of the edited source.
-        {
-            let mut attempts = self.sub_last_attempt.lock().await;
-            for (id, ..) in &mem_updates {
-                attempts.insert(id.clone(), finish_ts);
-            }
-        }
-
+        // Only record attempts after the optimistic commit succeeds.
+        let mut applied_attempts = Vec::new();
         if persist_needed {
-            if let Err(e) = transaction::commit_transaction_with_source(
+            if let Err(e) = transaction::commit_transaction_if_current(
                 &self.state,
                 candidate.clone(),
                 "subscription",
+                expected,
             )
             .await
             {
@@ -5194,12 +5195,14 @@ impl CoreManager {
                 );
                 return Err(e);
             }
+            applied_attempts.extend(mem_updates.iter().map(|(id, ..)| id.clone()));
             crate::ubus_bridge::sync_from_store_to_json_and_cache(&candidate);
             if core_reload_needed && !self.is_manually_stopped() {
                 let _ = self.apply_or_reload().await;
             }
         } else if !mem_updates.is_empty() {
             let mut d = self.state.data.write().await;
+            expected.ensure_current(&self.state, &d)?;
             for (id, ts, err, up, down, pref_ua) in mem_updates {
                 if let Some(src) = d
                     .outbound_sources
@@ -5215,11 +5218,18 @@ impl CoreManager {
                     src.sub_upload_bytes = up;
                     src.sub_download_bytes = down;
                     src.sub_preferred_user_agent = pref_ua;
+                    applied_attempts.push(id);
                 }
             }
             crate::ubus_bridge::sync_from_store_to_json_and_cache(&d);
             drop(d);
             self.state.bump_generation();
+        }
+        if !applied_attempts.is_empty() {
+            let mut attempts = self.sub_last_attempt.lock().await;
+            for id in applied_attempts {
+                attempts.insert(id, finish_ts);
+            }
         }
         Ok(updated_sources)
     }
