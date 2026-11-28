@@ -1,10 +1,8 @@
-name: Qualify pinned fork candidates
+name: Replay historical fork qualification
+# Historical exact-SHA replay only. Use the candidate's native CI for new work.
+# Retain the original pins to preserve reproducibility of the recorded runs.
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/qualify-fork-candidates.yml'
 
 permissions:
   contents: read
