@@ -124,6 +124,22 @@ export function render() {
             [],
           ),
 
+          // Independent local-service slot. The authenticated TorrServer
+          // adapter owns its content; it is not an inbound VPN server.
+          E(
+            'div',
+            {
+              id: 'dashboard-widget-torrserver',
+              class:
+                'tachyon-dashboard-widget-slot tachyon-dashboard-widget-slot--full',
+              style: 'display:none; order: 89;',
+            },
+            E('div', {
+              id: 'dashboard-torrserver-grid',
+              class: 'tachyon-inbounds-chip-grid',
+            }),
+          ),
+
           // Widget 6: Active Clients & Top Domains (Collapsible / Expanded / Domains Focus / Client Cards)
           E(
             'div',

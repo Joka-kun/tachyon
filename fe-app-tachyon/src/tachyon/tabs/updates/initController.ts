@@ -1944,7 +1944,13 @@ function renderUpdatesComponents() {
     const selectionEnd =
       activeEl instanceof HTMLInputElement ? activeEl.selectionEnd : null;
 
-    container.replaceChildren(...allCards);
+    // Preserve the installed local-service cards while native component state
+    // refreshes. They keep the same grid, focus and theme as native cards.
+    const localCards = ['tachyon-torrserver-card', 'tachyon-openwrt-card']
+      .map((id) => document.getElementById(id))
+      .filter((card): card is HTMLElement => card?.parentElement === container);
+
+    container.replaceChildren(...allCards, ...localCards);
 
     if (activeId) {
       const nextFocusEl = document.getElementById(activeId);
