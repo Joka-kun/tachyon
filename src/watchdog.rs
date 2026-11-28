@@ -1430,6 +1430,26 @@ pub fn should_reconcile_firewall_chains(
     }
 }
 
+// Share the existing watchdog loop. Unsupported nft JSON must never trigger
+// a network-stack apply. Bound both observation and repair costs.
+const CGROUP_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+const CGROUP_REPAIR_INTERVAL: Duration = Duration::from_secs(300);
+static LAST_CGROUP_PROBE: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+static LAST_CGROUP_REPAIR: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+fn take_due(last: &mut Option<Instant>, now: Instant, interval: Duration) -> bool {
+    if last.is_some_and(|ts| now.saturating_duration_since(ts) < interval) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
+
+fn take_cgroup_slot(lock: &std::sync::Mutex<Option<Instant>>, interval: Duration) -> bool {
+    lock.lock()
+        .is_ok_and(|mut last| take_due(&mut last, Instant::now(), interval))
+}
+
 /// Apply nftables/iptables network stack safely if missing while `tachyon-core` is alive,
 /// or keep the fail-closed kill-switch shut when `tachyon-core` is absent.
 pub async fn check_and_repair_nft_drift(
@@ -1459,6 +1479,33 @@ pub async fn check_and_repair_nft_drift(
                 "Repaired iptables firewall chains after external reset"
             }
             crate::platform::FirewallKind::Nftables => "Repaired inet TachyonTable drift",
+        };
+        live.push_event("warn", "reconciler", msg);
+    } else if nft_ok
+        && fw_kind == crate::platform::FirewallKind::Nftables
+        && proxy_mode == "tproxy"
+        && state.data.read().await.settings.torrserver_direct_enabled
+        && take_cgroup_slot(&LAST_CGROUP_PROBE, CGROUP_PROBE_INTERVAL)
+        && net_stack::torrserver_cgroup_drift().await == Some(true)
+        && take_cgroup_slot(&LAST_CGROUP_REPAIR, CGROUP_REPAIR_INTERVAL)
+    {
+        let store_snapshot = Box::new(state.data.read().await.clone());
+        if !store_snapshot.settings.torrserver_direct_enabled
+            || store_snapshot.settings.proxy_mode != "tproxy"
+        {
+            return;
+        }
+        let result = Box::pin(net_stack::reconcile_network_stack(&store_snapshot)).await;
+        let restored = net_stack::check_nft_table_active().await;
+        let repaired = result.is_ok()
+            && restored
+            && net_stack::torrserver_cgroup_drift().await == Some(false);
+        let mut live = state.live.write().await;
+        live.nft_table_active = restored;
+        let msg = if repaired {
+            "Repaired stale TorrServer cgroup binding"
+        } else {
+            "TorrServer cgroup binding repair not verified"
         };
         live.push_event("warn", "reconciler", msg);
     }
@@ -1499,6 +1546,22 @@ pub(crate) fn mark_drift_reload_executed(
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn cgroup_watchdog_slots_are_bounded() {
+        let now = Instant::now();
+        for interval in [CGROUP_PROBE_INTERVAL, CGROUP_REPAIR_INTERVAL] {
+            let mut last = None;
+            assert!(take_due(&mut last, now, interval));
+            assert!(!take_due(&mut last, now, interval));
+            assert!(!take_due(
+                &mut last,
+                now + interval - Duration::from_secs(1),
+                interval
+            ));
+            assert!(take_due(&mut last, now + interval, interval));
+        }
+    }
 
     #[test]
     fn hysteresis_requires_sustained_failures_and_recovery() {
