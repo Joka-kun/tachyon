@@ -759,29 +759,24 @@ fn commit_transaction_checked<'a>(
         .await
         .map_err(|e| anyhow::anyhow!("Transaction compile task failed: {e}"))??;
 
-        // Phase 3-4: compare the store again after compilation, while holding
-        // the same write guard used for the mutation. A stale candidate must
-        // not create a known-good snapshot or replace the current state.
-        let mut previous = {
-            let mut d = state.data.write().await;
-            swap_candidate_if_current(state, &mut d, candidate, expected.as_ref())?
-        };
+        // Phase 3-5: keep the store write guard through persistence and history.
+        // No other in-process data writer may interleave with these steps.
+        let recorded_id = {
+            let mut committed = state.data.write().await;
+            let mut previous =
+                swap_candidate_if_current(state, &mut committed, candidate, expected.as_ref())?;
 
-        if let Err(e) = state.save().await {
-            let mut d = state.data.write().await;
-            std::mem::swap(&mut *d, &mut *previous);
-            drop(d);
-            state.bump_generation();
-            anyhow::bail!("Transaction commit failed, rolled back in-memory state: {e}");
-        }
+            if let Err(e) = state.save_locked(&committed) {
+                std::mem::swap(&mut *committed, &mut *previous);
+                state.bump_generation();
+                anyhow::bail!("Transaction commit failed, rolled back in-memory state: {e}");
+            }
 
-        let core_cfg_res = {
-            let committed = state.data.read().await;
             let core_cfg_path = Path::new(&committed.settings.core_config_path);
-            crypto_gen::write_json_if_changed(core_cfg_path, &core_cfg)
+            let core_cfg_res = crypto_gen::write_json_if_changed(core_cfg_path, &core_cfg)
                 .map(|_| ())
                 .or_else(|e| {
-                    // Non-fatal on dev hosts where `/etc/tachyon-core` is not writable; fallback to local data dir
+                    // Preserve the existing development-host fallback.
                     if let Some(parent) = state.path.parent() {
                         let fallback_core = parent.join("tachyon-core-config.json");
                         crypto_gen::write_json_if_changed(&fallback_core, &core_cfg)
@@ -792,19 +787,20 @@ fn commit_transaction_checked<'a>(
                     } else {
                         Err(anyhow::anyhow!("{e}"))
                     }
-                })
-        };
-        if let Err(e) = core_cfg_res {
-            {
-                let mut d = state.data.write().await;
-                std::mem::swap(&mut *d, &mut *previous);
+                });
+            if let Err(e) = core_cfg_res {
+                std::mem::swap(&mut *committed, &mut *previous);
+                state.bump_generation();
+                if let Err(rollback) = state.save_locked(&committed) {
+                    anyhow::bail!(
+                        "Transaction commit failed writing core config: {e}; store rollback failed: {rollback}"
+                    );
+                }
+                anyhow::bail!(
+                    "Transaction commit failed writing core config, rolled back state: {e}"
+                );
             }
-            let _ = state.save().await;
-            anyhow::bail!("Transaction commit failed writing core config, rolled back state: {e}");
-        }
 
-        let recorded_id = {
-            let committed = state.data.read().await;
             match hist_dir.as_deref() {
                 Some(dir) => crate::config_history::record_commit_revision_in(
                     dir, &previous, &committed, source,
@@ -815,7 +811,6 @@ fn commit_transaction_checked<'a>(
             }
             .map(|s| s.id)
         };
-        drop(previous);
 
         // Phase 6-8: ACTIVATE & COMMIT (start LKG 180s observation window unless auto_rollback)
         {
@@ -899,6 +894,57 @@ pub async fn commit_transaction(
 mod tests {
     use super::*;
     use crate::store::{InboundServer, OutboundSource};
+
+    #[tokio::test]
+    async fn test_guarded_transaction_core_write_failure_rolls_back_store() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "tachyon_tx_core_write_fail_{}_{}",
+            std::process::id(),
+            crate::crypto_gen::generate_hex(4)
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("mkdir");
+        let store_path = tmp_dir.join("store.json");
+        let core_path = tmp_dir.join("blocked-core.json");
+        // Both the primary and fallback destination are directories, so
+        // atomic rename cannot publish a Core configuration at either path.
+        std::fs::create_dir(&core_path).expect("block primary");
+        std::fs::create_dir(tmp_dir.join("tachyon-core-config.json")).expect("block fallback");
+        let state = AppState::load_or_create(&store_path).expect("load store");
+        let (expected, mut candidate) = {
+            let current = state.data.read().await;
+            (
+                ExpectedStore::capture(&state, &current).expect("capture"),
+                clone_store_boxed(&current),
+            )
+        };
+        let original_label = candidate.sections[0].label.clone();
+        let original_bytes = std::fs::read(&store_path).expect("read original store");
+        candidate.settings.core_config_path = core_path.to_string_lossy().into_owned();
+        candidate.settings.tun_inet4 = "172.19.0.1/30".into();
+        candidate.settings.fakeip_inet4_range = "198.18.0.0/15".into();
+        candidate.settings.tun_inet6 = "fdfe:dcba:9876::1/126".into();
+        candidate.settings.fakeip_inet6_range = "fc00::/18".into();
+        candidate.sections[0].label = "must roll back".into();
+        let history_dir = tmp_dir.join("history");
+        let result = commit_transaction_checked(
+            &state,
+            candidate,
+            "subscription",
+            Some(history_dir.clone()),
+            Some(expected),
+        )
+        .await;
+        let error = result.expect_err("blocked Core destinations must fail");
+        assert!(
+            error.to_string().contains("rolled back state"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(state.data.read().await.sections[0].label, original_label);
+        assert_eq!(std::fs::read(&store_path).unwrap(), original_bytes);
+        assert!(!history_dir.exists());
+        assert!(core_path.is_dir());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
 
     #[tokio::test]
     async fn test_guarded_transaction_commits_current_candidate() {
