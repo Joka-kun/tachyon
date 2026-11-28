@@ -1,0 +1,247 @@
+name: Qualify pinned fork candidates
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/qualify-fork-candidates.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualify-pinned-fork-candidates
+  cancel-in-progress: false
+
+jobs:
+  rust:
+    name: qualify-${{ matrix.candidate }}-rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - candidate: pr20
+            sha: e307ced3f2d49d8f8e3e49d917da3d47f32a8da4
+          - candidate: pr21
+            sha: 3438c5dc1494d36c0f960034805847c27af1f863
+          - candidate: pr22
+            sha: e2714067c89911b57f1da3533fb2a0e3ecc5acbb
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.sha }}
+          persist-credentials: false
+
+      - name: Verify exact candidate SHA
+        env:
+          EXPECTED_SHA: ${{ matrix.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl, i686-unknown-linux-musl, aarch64-unknown-linux-musl, armv7-unknown-linux-musleabihf, arm-unknown-linux-musleabi, riscv64gc-unknown-linux-musl
+
+      - name: Cache Cargo registry and artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run unit tests
+        run: |
+          cargo test --all-targets --locked --no-run
+          RUST_MIN_STACK=524288 cargo test --all-targets --locked
+
+      - name: Verify Pure-Rust dependency tree on musl targets
+        run: |
+          set -euo pipefail
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            echo "Checking Pure-Rust tree for ${target}..."
+            bad="$(cargo tree --target "$target" -e normal,build --prefix none \
+              | grep -E '^(cc|cmake|bindgen|ring|aws-lc(-[A-Za-z0-9-]+)?|openssl(-src)?|libz(-sys)?|[A-Za-z0-9_-]+-sys) v' \
+              || true)"
+            if [[ -n "$bad" ]]; then
+              echo "Non-pure-Rust dependencies found for ${target}:" >&2
+              printf '%s\n' "$bad" >&2
+              exit 1
+            fi
+          done
+
+      - name: Verify MIPS32 64-bit atomic compatibility
+        run: |
+          set -euo pipefail
+          bad="$(grep -rnE --include='*.rs' '(^|[^A-Za-z0-9_])Atomic[UI]64([^A-Za-z0-9_]|$)' src/ \
+            | grep -v -E '^src/store\.rs:.*std::sync::atomic::AtomicU64' \
+            || true)"
+          if [[ -n "$bad" ]]; then
+            echo "Direct 64-bit atomics forbidden outside PortableAtomicU64 in src/store.rs (breaks MIPS32):" >&2
+            printf '%s\n' "$bad" >&2
+            exit 1
+          fi
+
+      - name: Check musl cross-compilation targets
+        run: |
+          cargo check --locked --target x86_64-unknown-linux-musl
+          cargo check --locked --target i686-unknown-linux-musl
+          cargo check --locked --target aarch64-unknown-linux-musl
+          cargo check --locked --target armv7-unknown-linux-musleabihf
+          cargo check --locked --target arm-unknown-linux-musleabi
+          cargo check --locked --target riscv64gc-unknown-linux-musl
+
+  frontend:
+    name: qualify-${{ matrix.candidate }}-frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - candidate: pr20
+            sha: e307ced3f2d49d8f8e3e49d917da3d47f32a8da4
+          - candidate: pr21
+            sha: 3438c5dc1494d36c0f960034805847c27af1f863
+          - candidate: pr22
+            sha: e2714067c89911b57f1da3533fb2a0e3ecc5acbb
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.sha }}
+          persist-credentials: false
+
+      - name: Verify exact candidate SHA
+        env:
+          EXPECTED_SHA: ${{ matrix.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: fe-app-tachyon/package-lock.json
+
+      - name: Install dependencies
+        working-directory: fe-app-tachyon
+        run: npm ci
+
+      - name: Actualize locales and run frontend CI
+        working-directory: fe-app-tachyon
+        run: |
+          npm run locales:actualize
+          npm run ci
+
+      - name: Ensure generated frontend and locale files are committed
+        run: |
+          set -euo pipefail
+          if git diff -I "POT-Creation-Date" -I "PO-Revision-Date" --quiet -- fe-app-tachyon/locales luci-app-tachyon/po; then
+            git checkout -- fe-app-tachyon/locales/*.pot fe-app-tachyon/locales/*.po luci-app-tachyon/po/ 2>/dev/null || true
+          fi
+          if ! git diff --quiet; then
+            echo "Generated frontend or locale files are out of date:" >&2
+            git status --short >&2
+            git diff --stat >&2
+            exit 1
+          fi
+
+  shellcheck:
+    name: qualify-${{ matrix.candidate }}-shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - candidate: pr20
+            sha: e307ced3f2d49d8f8e3e49d917da3d47f32a8da4
+          - candidate: pr21
+            sha: 3438c5dc1494d36c0f960034805847c27af1f863
+          - candidate: pr22
+            sha: e2714067c89911b57f1da3533fb2a0e3ecc5acbb
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.sha }}
+          persist-credentials: false
+
+      - name: Verify exact candidate SHA
+        env:
+          EXPECTED_SHA: ${{ matrix.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Run ShellCheck on scripts
+        run: |
+          shellcheck --severity=error \
+            build.sh \
+            install.sh \
+            uninstall.sh \
+            openwrt/tachyon.init \
+            entware/S99tachyon \
+            entware/ndm/netfilter.d/100-tachyon.sh \
+            entware/ndm/ifstatechanged.d/100-tachyon.sh \
+            entware/ndm/fs.d/100-tachyon.sh \
+            .githooks/pre-push
+
+      - name: Verify packager script syntax and Entware packaging tests
+        run: |
+          python3 -m py_compile tools/build_openwrt_pkg.py tools/build_entware_pkg.py
+          python3 tools/test_entware_pkg.py
+
+  report:
+    name: Publish actual exact-SHA job results
+    if: ${{ always() }}
+    needs: [rust, frontend, shellcheck]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      statuses: write
+    steps:
+      - name: Verify run and report individual job conclusions
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = Joka-kun/tachyon
+          test "$GITHUB_REF" = refs/heads/main
+          gh api --method GET "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs" -f per_page=100 > "$RUNNER_TEMP/qualification-jobs.json"
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          jobs = json.loads((Path(os.environ["RUNNER_TEMP"]) / "qualification-jobs.json").read_text())["jobs"]
+          targets = {"pr20":"e307ced3f2d49d8f8e3e49d917da3d47f32a8da4","pr21":"3438c5dc1494d36c0f960034805847c27af1f863","pr22":"e2714067c89911b57f1da3533fb2a0e3ecc5acbb"}
+          repo = os.environ["GITHUB_REPOSITORY"]
+          url = f'https://github.com/{repo}/actions/runs/{os.environ["GITHUB_RUN_ID"]}'
+          rows = []
+          failed = False
+          for label, sha in targets.items():
+              for kind in ("rust", "frontend", "shellcheck"):
+                  name = f"qualify-{label}-{kind}"
+                  found = [j for j in jobs if j["name"] == name]
+                  result = found[0]["conclusion"] if len(found) == 1 and found[0]["status"] == "completed" else None
+                  state = "success" if result == "success" else "failure" if result == "failure" else "error"
+                  failed |= state != "success"
+                  subprocess.run(["gh", "api", "--method", "POST", f"repos/{repo}/statuses/{sha}",
+                                  "-f", f"state={state}", "-f", f"context=qualification/v581/{kind}",
+                                  "-f", f"description=GitHub-hosted job: {result or 'unconfirmed'}",
+                                  "-f", f"target_url={url}"], check=True, stdout=subprocess.DEVNULL)
+                  rows.append(f"| {label} | {sha} | {kind} | {result or 'unconfirmed'} |")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("| Candidate | Exact SHA | Job | Conclusion |\n|---|---|---|---|\n" + "\n".join(rows) + "\n")
+          if failed:
+              raise SystemExit(1)
+          PY
