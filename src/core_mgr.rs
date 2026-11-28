@@ -4596,10 +4596,14 @@ impl CoreManager {
             }
             let mut src = orig_src.clone();
             let enc_src_id = crate::store::url_encode_component(&src.id);
-            let put_ok = self
-                .clash_request("PUT", &format!("/providers/proxies/{enc_src_id}"), None)
-                .await
-                .is_ok();
+            // A successful provider inventory can prove that this source has
+            // no native provider to refresh. Unknown inventories keep the
+            // existing attempt behavior.
+            let put_ok = native_provider_refresh_needed(providers_map.as_ref(), &src.id)
+                && self
+                    .clash_request("PUT", &format!("/providers/proxies/{enc_src_id}"), None)
+                    .await
+                    .is_ok();
             let fresh_providers = if put_ok {
                 self.clash_request("GET", "/providers/proxies", None)
                     .await
@@ -4610,7 +4614,7 @@ impl CoreManager {
 
             // Check if `tachyon-core` `/providers/proxies` has `subscriptionInfo` for this source
             if let Some(pmap) = fresh_providers.as_ref().or(providers_map.as_ref())
-                && let Some(prov) = pmap.pointer(&format!("/providers/{}", src.id))
+                && let Some(prov) = pmap.get("providers").and_then(|p| p.get(&src.id))
                 && let Some(sub_info) = prov.get("subscriptionInfo")
             {
                 if let Some(u) = sub_info.get("Upload").and_then(Value::as_u64) {
@@ -7696,6 +7700,15 @@ fn canonical_node_fingerprint(node: &crate::store::ParsedProxyNode) -> Value {
     })
 }
 
+// Only an actual provider map can establish absence. A failed or unsupported
+// GET must not disable native refresh.
+fn native_provider_refresh_needed(listing: Option<&Value>, source_id: &str) -> bool {
+    listing
+        .and_then(|v| v.get("providers"))
+        .and_then(Value::as_object)
+        .is_none_or(|providers| providers.contains_key(source_id))
+}
+
 // Resolve fetch endpoints once, using the same logic before and after network I/O.
 // This is an endpoint guard, not a proof of the route behind a mixed port.
 struct SubscriptionProxyContext {
@@ -8078,6 +8091,24 @@ fn parse_subscription_interval_secs(raw: &str) -> u64 {
 mod core_mgr_tests {
     use super::*;
     use crate::store::ParsedProxyNode;
+
+    #[test]
+    fn test_native_provider_refresh_skips_only_proven_absence() {
+        assert!(native_provider_refresh_needed(None, "source"));
+        assert!(native_provider_refresh_needed(
+            Some(&json!({"providers": null})),
+            "source"
+        ));
+        assert!(native_provider_refresh_needed(Some(&json!({})), "source"));
+        assert!(!native_provider_refresh_needed(
+            Some(&json!({"providers": {}})),
+            "source"
+        ));
+        let listing = json!({"providers": {"source": {}, "a/b~c": {}}});
+        assert!(native_provider_refresh_needed(Some(&listing), "source"));
+        assert!(native_provider_refresh_needed(Some(&listing), "a/b~c"));
+        assert!(!native_provider_refresh_needed(Some(&listing), "missing"));
+    }
 
     #[test]
     fn test_subscription_proxy_context_detects_endpoint_changes() {
