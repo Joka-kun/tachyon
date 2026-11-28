@@ -704,6 +704,23 @@ impl ExpectedStore {
     }
 }
 
+// Called with the store write lock held, after compilation.
+fn swap_candidate_if_current(
+    state: &AppState,
+    current: &mut RouterStoreData,
+    mut candidate: Box<RouterStoreData>,
+    expected: Option<&ExpectedStore>,
+) -> anyhow::Result<Box<RouterStoreData>> {
+    if let Some(expected) = expected {
+        expected.ensure_current(state, current)?;
+    }
+    if !state.lkg_path.exists() {
+        let _ = promote_to_known_good(&state.lkg_path, current);
+    }
+    std::mem::swap(current, &mut *candidate);
+    Ok(candidate)
+}
+
 #[inline(never)]
 fn commit_transaction_checked<'a>(
     state: &'a Arc<AppState>,
@@ -723,7 +740,7 @@ fn commit_transaction_checked<'a>(
 
         // Phase 1: PLAN (deduplicate cloned conditions and enforce cascade invariants)
         // Phase 2: PREFLIGHT & Phase 5: VALIDATE (offloaded so single-thread Tokio runtime stays responsive)
-        let (mut candidate, plan, core_cfg) = tokio::task::spawn_blocking(move || {
+        let (candidate, plan, core_cfg) = tokio::task::spawn_blocking(move || {
             let mut candidate = candidate;
             candidate.deduplicate_cloned_conditions();
             enforce_section_server_cascade(&mut candidate);
@@ -743,14 +760,7 @@ fn commit_transaction_checked<'a>(
         // not create a known-good snapshot or replace the current state.
         let mut previous = {
             let mut d = state.data.write().await;
-            if let Some(ref expected) = expected {
-                expected.ensure_current(state, &d)?;
-            }
-            if !state.lkg_path.exists() {
-                let _ = promote_to_known_good(&state.lkg_path, &d);
-            }
-            std::mem::swap(&mut *d, &mut *candidate);
-            candidate
+            swap_candidate_if_current(state, &mut d, candidate, expected.as_ref())?
         };
 
         if let Err(e) = state.save().await {
@@ -929,6 +939,35 @@ mod tests {
         assert_eq!(std::fs::read(&store_path).unwrap(), before_store);
         assert_eq!(std::fs::read(&state.lkg_path).ok(), before_lkg);
         assert!(!core_path.exists());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_guarded_swap_rejects_edit_after_preflight() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "tachyon_tx_late_edit_{}_{}",
+            std::process::id(),
+            crate::crypto_gen::generate_hex(4)
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("mkdir");
+        let state = AppState::load_or_create(&tmp_dir.join("store.json")).expect("load store");
+        let (expected, mut candidate) = {
+            let data = state.data.read().await;
+            let expected = ExpectedStore::capture(&state, &data).expect("capture");
+            assert!(expected.ensure_current(&state, &data).is_ok());
+            (expected, clone_store_boxed(&data))
+        };
+        candidate.sections[0].label = "prepared candidate".into();
+        let before_lkg = std::fs::read(&state.lkg_path).ok();
+        // Simulate a writer arriving while the compiler was running.
+        {
+            let mut current = state.data.write().await;
+            current.sections[0].label = "late edit".into();
+            let result = swap_candidate_if_current(&state, &mut current, candidate, Some(&expected));
+            assert!(result.is_err());
+            assert_eq!(current.sections[0].label, "late edit");
+        }
+        assert_eq!(std::fs::read(&state.lkg_path).ok(), before_lkg);
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
