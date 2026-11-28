@@ -1468,6 +1468,7 @@ pub async fn check_and_repair_nft_drift(
         return;
     }
     let fw_kind = crate::platform::firewall_kind();
+    let direct_enabled = { state.data.read().await.settings.torrserver_direct_enabled };
     if should_reconcile_firewall_chains(fw_kind, proxy_mode, nft_ok) {
         let store_snapshot = Box::new(state.data.read().await.clone());
         let _ = Box::pin(net_stack::reconcile_network_stack(&store_snapshot)).await;
@@ -1484,7 +1485,7 @@ pub async fn check_and_repair_nft_drift(
     } else if nft_ok
         && fw_kind == crate::platform::FirewallKind::Nftables
         && proxy_mode == "tproxy"
-        && state.data.read().await.settings.torrserver_direct_enabled
+        && direct_enabled
         && take_cgroup_slot(&LAST_CGROUP_PROBE, CGROUP_PROBE_INTERVAL)
         && net_stack::torrserver_cgroup_drift().await == Some(true)
         && take_cgroup_slot(&LAST_CGROUP_REPAIR, CGROUP_REPAIR_INTERVAL)
