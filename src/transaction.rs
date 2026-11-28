@@ -648,6 +648,7 @@ pub fn promote_to_known_good(lkg_path: &Path, data: &RouterStoreData) -> anyhow:
 }
 
 /// Clone `RouterStoreData` onto the heap without keeping temporary stack copies in async futures.
+#[cfg(test)]
 #[inline(never)]
 fn clone_store_boxed(src: &RouterStoreData) -> Box<RouterStoreData> {
     Box::new(src.clone())
@@ -695,7 +696,7 @@ impl ExpectedStore {
         })
     }
 
-    fn ensure_current(&self, state: &AppState, data: &RouterStoreData) -> anyhow::Result<()> {
+    pub(crate) fn ensure_current(&self, state: &AppState, data: &RouterStoreData) -> anyhow::Result<()> {
         if self.generation != state.store_generation() || self.data != serde_json::to_value(data)? {
             anyhow::bail!("Transaction conflict: store changed while preparing candidate");
         }
@@ -924,10 +925,7 @@ mod tests {
                 .to_string()
                 .contains("Transaction conflict")
         );
-        assert_eq!(
-            state.data.read().await.sections[0].label,
-            "concurrent edit"
-        );
+        assert_eq!(state.data.read().await.sections[0].label, "concurrent edit");
         assert_eq!(std::fs::read(&store_path).unwrap(), before_store);
         assert_eq!(std::fs::read(&state.lkg_path).ok(), before_lkg);
         assert!(!core_path.exists());
