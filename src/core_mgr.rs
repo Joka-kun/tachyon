@@ -4575,24 +4575,7 @@ impl CoreManager {
             .await
             .ok();
 
-        // Map section ID -> mixed_proxy_port for optional proxy-routed subscription fetches
-        let sec_proxy_ports: HashMap<String, u16> = snapshot
-            .sections
-            .iter()
-            .filter(|s| s.enabled && s.mixed_proxy_enabled && s.mixed_proxy_port > 0)
-            .map(|s| (s.id.clone(), s.mixed_proxy_port))
-            .collect();
-        let eff_core_cfg = Self::effective_core_config_path_for(&self.state, &snapshot.settings);
-        let service_mixed_port =
-            read_service_mixed_port_from_config(&eff_core_cfg.to_string_lossy());
-        let global_sub_proxy = if snapshot.settings.download_lists_via_proxy {
-            sec_proxy_ports
-                .get(&snapshot.settings.download_lists_via_proxy_section)
-                .copied()
-                .or(service_mixed_port)
-        } else {
-            None
-        };
+        let proxy_context = SubscriptionProxyContext::capture(&self.state, &snapshot);
 
         struct SubFetchResult {
             id: String,
@@ -4644,23 +4627,9 @@ impl CoreManager {
                 }
             }
 
-            let explicit_proxy_opt = if src.download_via_proxy_enabled {
-                sec_proxy_ports
-                    .get(&src.download_via_proxy_section)
-                    .copied()
-                    .or(global_sub_proxy)
-                    .or(service_mixed_port)
-            } else {
-                global_sub_proxy
-            }
-            .map(|p| format!("http://127.0.0.1:{p}"));
-            let auto_fallback_proxy_opt = if explicit_proxy_opt.is_none() {
-                service_mixed_port
-                    .or_else(|| sec_proxy_ports.values().copied().min())
-                    .map(|p| format!("http://127.0.0.1:{p}"))
-            } else {
-                None
-            };
+            let (explicit_port, fallback_port) = proxy_context.ports_for(&src);
+            let explicit_proxy_opt = explicit_port.map(|p| format!("http://127.0.0.1:{p}"));
+            let auto_fallback_proxy_opt = fallback_port.map(|p| format!("http://127.0.0.1:{p}"));
 
             let extra_headers = Self::build_subscription_request_headers(&src);
             let hwid_free_headers = Self::build_subscription_request_headers_inner(&src, false);
@@ -5090,6 +5059,7 @@ impl CoreManager {
                 current.clone(),
             )
         };
+        let current_proxy_context = SubscriptionProxyContext::capture(&self.state, &candidate);
         let mut updated_sources = 0usize;
         let mut persist_needed = false;
         let mut core_reload_needed = false;
@@ -5109,6 +5079,8 @@ impl CoreManager {
                 .outbound_sources
                 .iter()
                 .any(|original| subscription_request_unchanged(original, src))
+                || proxy_context.config_path != current_proxy_context.config_path
+                || proxy_context.ports_for(src) != current_proxy_context.ports_for(src)
             {
                 continue;
             }
@@ -7719,6 +7691,69 @@ fn canonical_node_fingerprint(node: &crate::store::ParsedProxyNode) -> Value {
     })
 }
 
+// Resolve fetch endpoints once, using the same logic before and after network I/O.
+// This is an endpoint guard, not a proof of the route behind a mixed port.
+struct SubscriptionProxyContext {
+    config_path: PathBuf,
+    section_ports: HashMap<String, u16>,
+    service_port: Option<u16>,
+    global_port: Option<u16>,
+}
+
+impl SubscriptionProxyContext {
+    fn capture(state: &AppState, store: &crate::store::RouterStoreData) -> Self {
+        let config_path = CoreManager::effective_core_config_path_for(state, &store.settings);
+        let service_port = read_service_mixed_port_from_config(&config_path.to_string_lossy());
+        Self::from_store(store, config_path, service_port)
+    }
+
+    fn from_store(
+        store: &crate::store::RouterStoreData,
+        config_path: PathBuf,
+        service_port: Option<u16>,
+    ) -> Self {
+        let section_ports: HashMap<String, u16> = store
+            .sections
+            .iter()
+            .filter(|s| s.enabled && s.mixed_proxy_enabled && s.mixed_proxy_port > 0)
+            .map(|s| (s.id.clone(), s.mixed_proxy_port))
+            .collect();
+        let global_port = if store.settings.download_lists_via_proxy {
+            section_ports
+                .get(&store.settings.download_lists_via_proxy_section)
+                .copied()
+                .or(service_port)
+        } else {
+            None
+        };
+        Self {
+            config_path,
+            section_ports,
+            service_port,
+            global_port,
+        }
+    }
+
+    fn ports_for(&self, src: &crate::store::OutboundSource) -> (Option<u16>, Option<u16>) {
+        let explicit = if src.download_via_proxy_enabled {
+            self.section_ports
+                .get(&src.download_via_proxy_section)
+                .copied()
+                .or(self.global_port)
+                .or(self.service_port)
+        } else {
+            self.global_port
+        };
+        let fallback = if explicit.is_none() {
+            self.service_port
+                .or_else(|| self.section_ports.values().copied().min())
+        } else {
+            None
+        };
+        (explicit, fallback)
+    }
+}
+
 // Compare the source inputs captured before network I/O, not the fetched
 // metadata or the lossy node-reload fingerprint. This is a source-level
 // guard; it does not replace transaction-level concurrency control.
@@ -8038,6 +8073,59 @@ fn parse_subscription_interval_secs(raw: &str) -> u64 {
 mod core_mgr_tests {
     use super::*;
     use crate::store::ParsedProxyNode;
+
+    #[test]
+    fn test_subscription_proxy_context_detects_endpoint_changes() {
+        let mut store = crate::store::RouterStoreData::default();
+        store.sections.clear();
+        store.sections.push(crate::store::RoutingSection {
+            id: "route".into(),
+            enabled: true,
+            mixed_proxy_enabled: true,
+            mixed_proxy_port: 18080,
+            ..Default::default()
+        });
+        store.settings.download_lists_via_proxy = true;
+        store.settings.download_lists_via_proxy_section = "route".into();
+        let src = crate::store::OutboundSource::default();
+        let capture = |store: &crate::store::RouterStoreData, service| {
+            SubscriptionProxyContext::from_store(store, PathBuf::from("fixture.json"), service)
+        };
+        let before = capture(&store, Some(19090));
+        assert_eq!(before.ports_for(&src), (Some(18080), None));
+
+        store.sections[0].mixed_proxy_port = 18081;
+        assert_eq!(
+            capture(&store, Some(19090)).ports_for(&src),
+            (Some(18081), None)
+        );
+        store.sections[0].enabled = false;
+        assert_eq!(
+            capture(&store, Some(19090)).ports_for(&src),
+            (Some(19090), None)
+        );
+        store.settings.download_lists_via_proxy = false;
+        assert_eq!(
+            capture(&store, Some(19090)).ports_for(&src),
+            (None, Some(19090))
+        );
+        assert_eq!(
+            capture(&store, Some(19091)).ports_for(&src),
+            (None, Some(19091))
+        );
+
+        store.sections[0].enabled = true;
+        assert_eq!(capture(&store, None).ports_for(&src), (None, Some(18081)));
+        let direct_source = crate::store::OutboundSource {
+            download_via_proxy_enabled: true,
+            download_via_proxy_section: "route".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            capture(&store, Some(19090)).ports_for(&direct_source),
+            (Some(18081), None)
+        );
+    }
 
     #[test]
     fn test_subscription_request_unchanged_rejects_source_edits() {
