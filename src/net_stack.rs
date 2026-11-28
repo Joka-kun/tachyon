@@ -2580,6 +2580,106 @@ fn discover_torrserver_cgroupv2() -> Option<(usize, String)> {
     None
 }
 
+// Read only Tachyon-owned DIRECT rules from nft's JSON representation.
+// On nft 1.1.7 a deleted cgroup resolves to a decimal ID string, not its
+// former path. Do not repair based on malformed/unsupported JSON.
+fn torrserver_direct_rules_drift(
+    listing: &serde_json::Value,
+    expected: &str,
+    expected_secondary: Option<bool>,
+) -> Option<bool> {
+    let entries = listing.get("nftables")?.as_array()?;
+    if !entries.iter().any(|entry| {
+        entry
+            .pointer("/chain/family")
+            .and_then(serde_json::Value::as_str)
+            == Some("inet")
+            && entry
+                .pointer("/chain/table")
+                .and_then(serde_json::Value::as_str)
+                == Some("TachyonTable")
+            && entry
+                .pointer("/chain/name")
+                .and_then(serde_json::Value::as_str)
+                == Some("mangle_output")
+    }) {
+        return None;
+    }
+    let mut primary = 0;
+    let mut secondary = 0;
+    let mut drift = false;
+    for rule in entries.iter().filter_map(|entry| entry.get("rule")) {
+        match rule.get("comment").and_then(serde_json::Value::as_str) {
+            Some("tachyon-torrserver-direct") => primary += 1,
+            Some("tachyon-torrserver-direct-v6") => secondary += 1,
+            _ => continue,
+        }
+        let mut matches = 0;
+        for expr in rule.get("expr")?.as_array()? {
+            if expr
+                .pointer("/match/left/socket/key")
+                .and_then(serde_json::Value::as_str)
+                != Some("cgroupv2")
+            {
+                continue;
+            }
+            if expr.pointer("/match/op")?.as_str()? != "==" {
+                return None;
+            }
+            matches += 1;
+            drift |= expr.pointer("/match/right")?.as_str()? != expected;
+        }
+        drift |= matches != 1;
+    }
+    Some(
+        drift
+            || primary != 1
+            || secondary > 1
+            || expected_secondary.is_some_and(|expected| secondary != usize::from(expected)),
+    )
+}
+
+// Reuse the desired ruleset already cached by the network-stack apply path.
+// A missing cache or primary rule does not establish the IPv6 expectation.
+fn torrserver_direct_secondary_expected(skeleton: Option<&str>) -> Option<bool> {
+    skeleton
+        .filter(|text| text.contains("comment \"tachyon-torrserver-direct\""))
+        .map(|text| text.contains("comment \"tachyon-torrserver-direct-v6\""))
+}
+
+/// Read-only check. No dedicated cgroup or unavailable JSON is inconclusive.
+pub(crate) async fn torrserver_cgroup_drift() -> Option<bool> {
+    let (_, expected) = tokio::task::spawn_blocking(discover_torrserver_cgroupv2)
+        .await
+        .ok()??;
+    let mut cmd = Command::new("nft");
+    cmd.args([
+        "-j",
+        "-nn",
+        "list",
+        "chain",
+        "inet",
+        "TachyonTable",
+        "mangle_output",
+    ])
+    .kill_on_drop(true)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+    let out = tokio::time::timeout(Duration::from_secs(5), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let listing = serde_json::from_slice(&out.stdout).ok()?;
+    let expected_secondary = {
+        let guard = nft_skeleton_lock().lock().await;
+        torrserver_direct_secondary_expected(guard.as_deref())
+    };
+    torrserver_direct_rules_drift(&listing, &expected, expected_secondary)
+}
+
 #[cfg(test)]
 fn compile_nftables_ruleset_full(
     store: &RouterStoreData,
@@ -5321,6 +5421,13 @@ pub(crate) fn nft_ruleset_skeleton_without_selective_v4(ruleset: &str) -> String
     }
 }
 
+// A socket cgroupv2 expression resolves a path to a kernel cgroup ID when
+// nft installs the rule. A recreated cgroup can have the same path and a new
+// ID, so a textual skeleton match cannot justify a selective-set-only update.
+fn nft_set_delta_eligible(cached: Option<&str>, desired_skeleton: &str) -> bool {
+    cached == Some(desired_skeleton) && !desired_skeleton.contains("socket cgroupv2")
+}
+
 pub(crate) fn extract_selective_v4_elements_from_ruleset(ruleset: &str) -> Option<Vec<String>> {
     let (start, end) = find_selective_v4_elements_span(ruleset)?;
     let inner = &ruleset[start..end];
@@ -6154,7 +6261,7 @@ async fn apply_network_stack_inner(
             let mut applied_via_delta = false;
             let skeleton_matches = {
                 let guard = nft_skeleton_lock().lock().await;
-                guard.as_deref() == Some(new_skeleton.as_str())
+                nft_set_delta_eligible(guard.as_deref(), &new_skeleton)
             };
             if skeleton_matches
                 && let Some(desired_v4) = extract_selective_v4_elements_from_ruleset(&ruleset)
@@ -9477,6 +9584,117 @@ dhcp.cfg01411c.tachyon_prev_server='1.1.1.1 8.8.8.8'
             "ip saddr { 192.168.1.5 } udp dport { 3074, 27015-27030 } tproxy ip to 127.0.0.1:1602"
         ));
         assert!(pre.contains("udp dport { 19294-19344, 50000-50100 } tproxy ip to 127.0.0.1:1602"));
+    }
+
+    #[test]
+    fn test_torrserver_direct_drift_uses_live_cgroup_binding() {
+        let listing = |right: serde_json::Value| {
+            serde_json::json!({"nftables": [
+                {"chain": {"family":"inet","table":"TachyonTable","name":"mangle_output"}},
+                {"rule": {"comment":"unrelated", "expr":[]}},
+                {"rule": {"comment":"tachyon-torrserver-direct", "expr":[
+                    {"match":{"op":"==","left":{"socket":{"key":"cgroupv2"}},"right":right}}
+                ]}}
+            ]})
+        };
+        let path = "services/torrserver";
+        assert_eq!(
+            torrserver_direct_rules_drift(&listing(serde_json::json!(path)), path, None),
+            Some(false)
+        );
+        assert_eq!(
+            torrserver_direct_rules_drift(&listing(serde_json::json!("2522")), path, None),
+            Some(true)
+        );
+        assert_eq!(
+            torrserver_direct_rules_drift(&listing(serde_json::json!(2522)), path, None),
+            None
+        );
+        let mut missing = listing(serde_json::json!(path));
+        missing["nftables"].as_array_mut().unwrap().pop();
+        assert_eq!(
+            torrserver_direct_rules_drift(&missing, path, None),
+            Some(true)
+        );
+        let mut duplicate = listing(serde_json::json!(path));
+        let extra = duplicate["nftables"][2].clone();
+        duplicate["nftables"].as_array_mut().unwrap().push(extra);
+        assert_eq!(
+            torrserver_direct_rules_drift(&duplicate, path, None),
+            Some(true)
+        );
+        assert_eq!(
+            torrserver_direct_rules_drift(&serde_json::json!({}), path, None),
+            None
+        );
+    }
+
+    #[test]
+    fn test_torrserver_direct_secondary_matches_cached_desired_ruleset() {
+        let path = "services/torrserver";
+        let primary = "comment \"tachyon-torrserver-direct\"";
+        let both =
+            "comment \"tachyon-torrserver-direct\"\ncomment \"tachyon-torrserver-direct-v6\"";
+        assert_eq!(torrserver_direct_secondary_expected(None), None);
+        assert_eq!(
+            torrserver_direct_secondary_expected(Some("unrelated")),
+            None
+        );
+        assert_eq!(
+            torrserver_direct_secondary_expected(Some(primary)),
+            Some(false)
+        );
+        assert_eq!(torrserver_direct_secondary_expected(Some(both)), Some(true));
+
+        let mut listing = serde_json::json!({"nftables": [
+            {"chain": {"family":"inet","table":"TachyonTable","name":"mangle_output"}},
+            {"rule": {"comment":"tachyon-torrserver-direct", "expr":[
+                {"match":{"op":"==","left":{"socket":{"key":"cgroupv2"}},"right":path}}
+            ]}}
+        ]});
+        assert_eq!(
+            torrserver_direct_rules_drift(&listing, path, Some(true)),
+            Some(true)
+        );
+        assert_eq!(
+            torrserver_direct_rules_drift(&listing, path, Some(false)),
+            Some(false)
+        );
+        let mut secondary = listing["nftables"][1].clone();
+        secondary["rule"]["comment"] = serde_json::json!("tachyon-torrserver-direct-v6");
+        listing["nftables"].as_array_mut().unwrap().push(secondary);
+        assert_eq!(
+            torrserver_direct_rules_drift(&listing, path, Some(true)),
+            Some(false)
+        );
+        assert_eq!(
+            torrserver_direct_rules_drift(&listing, path, Some(false)),
+            Some(true)
+        );
+        assert_eq!(
+            torrserver_direct_rules_drift(&listing, path, None),
+            Some(false)
+        );
+        let secondary = listing["nftables"][2].clone();
+        listing["nftables"].as_array_mut().unwrap().push(secondary);
+        assert_eq!(
+            torrserver_direct_rules_drift(&listing, path, Some(true)),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_nft_set_delta_requires_full_apply_for_cgroup_rules() {
+        let ordinary = "chain output { meta mark set 0x40000000 }";
+        let cgroup = "chain output { socket cgroupv2 level 2 \"services/torrserver\" counter }";
+
+        assert!(nft_set_delta_eligible(Some(ordinary), ordinary));
+        assert!(!nft_set_delta_eligible(None, ordinary));
+        assert!(!nft_set_delta_eligible(Some(ordinary), cgroup));
+        // Identical path text does not prove that the kernel cgroup ID is
+        // unchanged. Also retry a prior apply that fell back without cgroup.
+        assert!(!nft_set_delta_eligible(Some(cgroup), cgroup));
+        assert!(!nft_set_delta_eligible(Some(cgroup), ordinary));
     }
 
     #[test]
