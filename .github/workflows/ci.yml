@@ -12,6 +12,7 @@ on:
       - main
       - master
       - '2.0'
+      - product
   workflow_dispatch:
 
 permissions:
@@ -126,7 +127,7 @@ jobs:
       # Product source qualification generates assets without writing to Git.
       # The strict committed-assets check below remains mandatory.
       - name: Capture generated product frontend candidate
-        if: github.event_name == 'push' && github.ref == 'refs/heads/product'
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/product') || (github.event_name == 'pull_request' && github.base_ref == 'product')
         shell: bash
         run: |
           set -euo pipefail
@@ -137,7 +138,7 @@ jobs:
           sha256sum generated.patch source-commit.txt > SHA256SUMS
 
       - name: Upload generated product frontend candidate
-        if: github.event_name == 'push' && github.ref == 'refs/heads/product'
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/product') || (github.event_name == 'pull_request' && github.base_ref == 'product')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: product-generated-frontend-${{ github.sha }}
