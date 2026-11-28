@@ -116,9 +116,28 @@ jobs:
               git fetch --no-tags https://github.com/Joka-kun/tachyon.git "$head"
               test "$(git rev-parse FETCH_HEAD)" = "$head"
               if ! git -c core.hooksPath=/dev/null -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' merge --no-ff --no-edit "$head"; then
-                printf 'INTEGRATION_CONFLICT_HOLD PR=%s SHA=%s\n' "$pr" "$head"
-                git diff --name-only --diff-filter=U
-                exit 78
+                # PRs 536 and 537 insert independent helpers and tests at the same anchors.
+                # This reviewed resolution is valid only for the exact three source blobs
+                # and the independently reconstructed result. No general conflict policy.
+                file=src/diagnostics.rs
+                if [[ "$pr" != 537 || "$head" != d3d923be6c059a4f738c9a57c206434d8c1cdaed || "$(git diff --name-only --diff-filter=U)" != "$file" ]]; then
+                  printf 'INTEGRATION_CONFLICT_HOLD PR=%s SHA=%s\n' "$pr" "$head"
+                  git diff --name-only --diff-filter=U
+                  exit 78
+                fi
+                [[ "$(git rev-parse ":1:$file")" == 9a06c7c16e2c126b0e535c867c5342159b64b62e ]]
+                [[ "$(git rev-parse ":2:$file")" == e78ad16a394c34d71d7bdf73d1cd329f4c3847b1 ]]
+                [[ "$(git rev-parse ":3:$file")" == 54ed2033b2ce890ada033cbdf0f7e9d40862ad4f ]]
+                for stage in 1 2 3; do
+                  git show ":$stage:$file" > "$RUNNER_TEMP/diagnostics-stage-$stage.rs"
+                done
+                git merge-file --union -p "$RUNNER_TEMP/diagnostics-stage-2.rs" "$RUNNER_TEMP/diagnostics-stage-1.rs" "$RUNNER_TEMP/diagnostics-stage-3.rs" > "$RUNNER_TEMP/diagnostics-reviewed.rs"
+                [[ "$(git hash-object "$RUNNER_TEMP/diagnostics-reviewed.rs")" == 62ee528859cfb5815d06b4e1f8602ee7d1058c7e ]] || { echo REVIEWED_DIAGNOSTICS_RESULT_HOLD; exit 78; }
+                cp "$RUNNER_TEMP/diagnostics-reviewed.rs" "$file"
+                git add -- "$file"
+                test -z "$(git diff --name-only --diff-filter=U)"
+                git -c core.hooksPath=/dev/null -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit --no-edit
+                echo REVIEWED_DIAGNOSTICS_MERGE_PASS
               fi
               printf 'INTEGRATION_PR_%s=%s\n' "$pr" "$head"
             done < "$RUNNER_TEMP/tachyon-fix-heads"
