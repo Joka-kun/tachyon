@@ -1,0 +1,64 @@
+{
+  "schema": 1,
+  "base": {
+    "repository": "Dushnilin/tachyon",
+    "tag": "v2.0.0-rc.6",
+    "commit": "a33831cc4e92f9fc3614f9cd361e51e4aafd9c9c"
+  },
+  "adapter": {
+    "repository": "Joka-kun/tachyon",
+    "baseline": "53ae666f2124dc20bf773abd4d27e926b70806e5"
+  },
+  "fixes": [
+    {
+      "pr": 530,
+      "commit": "b3526077f543a4608e4da2897bafe144361e738e"
+    },
+    {
+      "pr": 531,
+      "commit": "0585a673b01b313188f83280937ecc408ee4174c"
+    },
+    {
+      "pr": 532,
+      "commit": "029d081f9d1368fc74c95991315c167e530aa6f4"
+    },
+    {
+      "pr": 533,
+      "commit": "d0a6d4bebe7e9de0ae7fc3edc19c603ccd3d73ae"
+    },
+    {
+      "pr": 536,
+      "commit": "4a2b2d619348450d7e58565b944f4d9c6afc4047"
+    },
+    {
+      "pr": 537,
+      "commit": "d3d923be6c059a4f738c9a57c206434d8c1cdaed"
+    },
+    {
+      "pr": 556,
+      "commit": "3ac9a8724324fec1d161c6e5921e4029d2ed865e"
+    },
+    {
+      "pr": 559,
+      "commit": "7498f801a99dfd73e7263913e079673fa3649c38"
+    },
+    {
+      "pr": 560,
+      "commit": "f73a7b5c89e67a853c8cfe77218c5794f3b9c5f7"
+    }
+  ],
+  "evaluation_only": [
+    {
+      "pr": 21,
+      "commit": "1e7715538bfac29f7e5d93a4ee81e84ebb815902",
+      "reason": "transaction and adapter overlap requires independent combined acceptance"
+    },
+    {
+      "pr": 22,
+      "commit": "2f4eaf7099b266536d9aa9704dcbe5b6cc833ff2",
+      "reason": "stacked watchdog requires native replacement parity; avoid duplicate recovery loops"
+    }
+  ],
+  "status": "candidate_only",
+  "promotion": "requires integrated CI, package and native rollback tests, verified DNS telemetry semantics, and separate device acceptance"
+}
