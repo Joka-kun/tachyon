@@ -1795,6 +1795,21 @@ async fn handle_single_ubus_rpc_with_sync(
     })
 }
 
+fn should_forward_router_ubus_call(object: &str, method: &str) -> bool {
+    matches!(
+        (object, method),
+        (
+            "luci-rpc",
+            "getHostHints"
+                | "getDHCPLeases"
+                | "getNetworkDevices"
+                | "getWirelessDevices"
+                | "getBoardJSON"
+        ) | ("network.interface", _)
+            | ("network", _)
+    )
+}
+
 async fn dispatch_ubus_call_with_sync(
     object: &str,
     method: &str,
@@ -1869,14 +1884,8 @@ async fn dispatch_ubus_call_with_sync(
             handle_uci_call_with_sync(uci_method, args, state, core, sync_after_uci_mutation).await
         }
         ("luci-rpc", _) | ("network.interface", _) | ("network", _) => {
-            if matches!(
-                (object, method),
-                (
-                    "luci-rpc",
-                    "getNetworkDevices" | "getWirelessDevices" | "getBoardJSON"
-                ) | ("network.interface", _)
-                    | ("network", _)
-            ) && let Some(res) = call_router_ubus_cli(object, method, args).await
+            if should_forward_router_ubus_call(object, method)
+                && let Some(res) = call_router_ubus_cli(object, method, args).await
             {
                 return res;
             }
@@ -5592,6 +5601,7 @@ fn lookup_uri_by_tag<'a>(
 fn build_outbound_metadata_and_links(
     store: &crate::store::RouterStoreData,
     section: &str,
+    include_links: bool,
 ) -> (Value, Map<String, Value>, Map<String, Value>) {
     let mut names = Map::new();
     let mut countries = Map::new();
@@ -5638,30 +5648,32 @@ fn build_outbound_metadata_and_links(
 
         let mut uri_by_tag: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
-        for node in &src.cached_nodes {
-            if !node.raw_uri.trim().is_empty() {
-                uri_by_tag.insert(node.tag.clone(), node.raw_uri.clone());
-                if !src.node_prefix.trim().is_empty() {
-                    uri_by_tag.insert(
-                        format!("{}{}", src.node_prefix, node.tag),
-                        node.raw_uri.clone(),
-                    );
+        if include_links {
+            for node in &src.cached_nodes {
+                if !node.raw_uri.trim().is_empty() {
+                    uri_by_tag.insert(node.tag.clone(), node.raw_uri.clone());
+                    if !src.node_prefix.trim().is_empty() {
+                        uri_by_tag.insert(
+                            format!("{}{}", src.node_prefix, node.tag),
+                            node.raw_uri.clone(),
+                        );
+                    }
                 }
             }
-        }
-        for (idx, raw) in src.proxy_links.iter().enumerate() {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-            if let Some(parsed) = crate::config_gen::parse_proxy_uri(trimmed, idx) {
-                uri_by_tag
-                    .entry(parsed.tag.clone())
-                    .or_insert_with(|| trimmed.to_string());
-                if !src.node_prefix.trim().is_empty() {
+            for (idx, raw) in src.proxy_links.iter().enumerate() {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                if let Some(parsed) = crate::config_gen::parse_proxy_uri(trimmed, idx) {
                     uri_by_tag
-                        .entry(format!("{}{}", src.node_prefix, parsed.tag))
+                        .entry(parsed.tag.clone())
                         .or_insert_with(|| trimmed.to_string());
+                    if !src.node_prefix.trim().is_empty() {
+                        uri_by_tag
+                            .entry(format!("{}{}", src.node_prefix, parsed.tag))
+                            .or_insert_with(|| trimmed.to_string());
+                    }
                 }
             }
         }
@@ -5850,7 +5862,7 @@ async fn get_subscription_metadata_cached_json(state: &AppState, section: &str) 
 }
 
 fn read_pure_rust_outbound_metadata(store: &crate::store::RouterStoreData, section: &str) -> Value {
-    let (mut meta_val, _, _) = build_outbound_metadata_and_links(store, section);
+    let (mut meta_val, _, _) = build_outbound_metadata_and_links(store, section, false);
     let has_any = meta_val
         .get("names")
         .and_then(Value::as_object)
@@ -6027,7 +6039,8 @@ pub fn sync_section_cache(store: &crate::store::RouterStoreData) {
         }
         let fname = format!("{}.json", sec.id);
         active_files.insert(fname.clone());
-        let (outbound_meta, links, hidden) = build_outbound_metadata_and_links(store, &sec.id);
+        let (outbound_meta, links, hidden) =
+            build_outbound_metadata_and_links(store, &sec.id, true);
         let sub_meta = read_pure_rust_subscription_metadata(store, &sec.id);
         let (urltest_groups, priority_groups) = balancer_caches
             .remove(&sec.id)
@@ -6047,7 +6060,7 @@ pub fn sync_section_cache(store: &crate::store::RouterStoreData) {
     // Aggregate all sources (including unassigned subscriptions/nodes) in `_sources.json`
     active_files.insert("_sources.json".to_string());
     let (all_outbound_meta, all_links, all_hidden) =
-        build_outbound_metadata_and_links(store, "_sources");
+        build_outbound_metadata_and_links(store, "_sources", true);
     let all_sub_meta = read_pure_rust_subscription_metadata(store, "_sources");
     let sources_payload = json!({
         "section": "_sources",
@@ -7073,10 +7086,21 @@ fn resolve_clash_group_for_target(
                     return cand.clone();
                 }
             }
+            let active = sec.active_selected_tag.trim();
+            if !active.is_empty() && map.contains_key(active) {
+                return active.to_string();
+            }
+            let store_tags = collect_store_section_leaf_tags(store, &sec.id);
+            if let Some(single_tag) = store_tags.into_iter().find(|t| map.contains_key(t)) {
+                return single_tag;
+            }
         }
-        if let Some(first) = candidates.into_iter().next() {
+        if !sec.balancer_refs.is_empty()
+            && let Some(first) = candidates.into_iter().next()
+        {
             return first;
         }
+        return format!("sel-{}", sec.id);
     }
     req.to_string()
 }
@@ -7338,9 +7362,34 @@ fn resolve_latency_targets(
             trimmed_tag
         };
         let eff_group = resolve_clash_group_for_target(store, proxies_map, req);
-        let tags = proxies_map
+        let mut tags = proxies_map
             .map(|pm| collect_clash_leaf_members(pm, &eff_group))
             .unwrap_or_default();
+        if tags.is_empty() {
+            if let Some(pm) = proxies_map
+                && pm.contains_key(&eff_group)
+                && !matches!(
+                    eff_group.as_str(),
+                    "direct" | "block" | "GLOBAL" | "reject" | "dns-out"
+                )
+            {
+                tags.push(eff_group.clone());
+            } else {
+                let sec_base = req
+                    .strip_prefix("sel-")
+                    .or_else(|| req.strip_suffix("-out"))
+                    .unwrap_or(req);
+                let store_tags = collect_store_section_leaf_tags(store, sec_base);
+                if let Some(pm) = proxies_map {
+                    tags = store_tags
+                        .into_iter()
+                        .filter(|t| pm.contains_key(t))
+                        .collect();
+                } else {
+                    tags = store_tags;
+                }
+            }
+        }
         return (tags, eff_group);
     }
 
@@ -7916,7 +7965,7 @@ async fn build_pure_rust_core_telemetry(state: &Arc<AppState>, core: &Arc<CoreMa
         .collect();
 
     // Aggregate outbounds & protocols from /connections and /tachyon/flight
-    let mut outbound_map: std::collections::HashMap<String, (u64, u64, u64, u64)> =
+    let mut outbound_map: std::collections::HashMap<&str, (u64, u64, u64, u64)> =
         std::collections::HashMap::new();
     let mut tcp_count = 0u64;
     let mut udp_count = 0u64;
@@ -7933,14 +7982,17 @@ async fn build_pure_rust_core_telemetry(state: &Arc<AppState>, core: &Arc<CoreMa
                 .get("metadata")
                 .and_then(|m| m.get("network"))
                 .and_then(Value::as_str)
-                .unwrap_or("tcp")
-                .to_ascii_lowercase();
+                .unwrap_or("tcp");
             let dst_port = c
                 .get("metadata")
                 .and_then(|m| m.get("destinationPort"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            if net.contains("udp") {
+            if net
+                .as_bytes()
+                .windows(3)
+                .any(|part| part.eq_ignore_ascii_case(b"udp"))
+            {
                 if dst_port == "443" {
                     quic_count += 1;
                 } else {
@@ -7954,8 +8006,7 @@ async fn build_pure_rust_core_telemetry(state: &Arc<AppState>, core: &Arc<CoreMa
                 .and_then(Value::as_array)
                 .and_then(|a| a.first())
                 .and_then(Value::as_str)
-                .unwrap_or("direct-out")
-                .to_string();
+                .unwrap_or("direct-out");
             let up = c.get("upload").and_then(Value::as_u64).unwrap_or(0);
             let down = c.get("download").and_then(Value::as_u64).unwrap_or(0);
             let entry = outbound_map.entry(chain).or_insert((0, 0, 0, 0));
@@ -7974,11 +8025,10 @@ async fn build_pure_rust_core_telemetry(state: &Arc<AppState>, core: &Arc<CoreMa
                 let outbound = e
                     .get("outbound")
                     .and_then(Value::as_str)
-                    .unwrap_or("direct-out")
-                    .to_string();
+                    .unwrap_or("direct-out");
                 let up = e.get("upload").and_then(Value::as_u64).unwrap_or(0);
                 let down = e.get("download").and_then(Value::as_u64).unwrap_or(0);
-                let entry = outbound_map.entry(outbound.clone()).or_insert((0, 0, 0, 0));
+                let entry = outbound_map.entry(outbound).or_insert((0, 0, 0, 0));
                 entry.1 = entry.1.saturating_add(up);
                 entry.2 = entry.2.saturating_add(down);
                 entry.3 += 1;
@@ -7998,7 +8048,7 @@ async fn build_pure_rust_core_telemetry(state: &Arc<AppState>, core: &Arc<CoreMa
                     "host": e.get("host").and_then(Value::as_str).unwrap_or(""),
                     "destination": e.get("destination").and_then(Value::as_str).unwrap_or(""),
                     "outbound": outbound,
-                    "outbound_display_name": resolve_telemetry_tag_display_name(&outbound, &tag_display_map, &store_snap),
+                    "outbound_display_name": resolve_telemetry_tag_display_name(outbound, &tag_display_map, &store_snap),
                     "rule": short_rule,
                     "upload": up,
                     "download": down,
@@ -8009,7 +8059,7 @@ async fn build_pure_rust_core_telemetry(state: &Arc<AppState>, core: &Arc<CoreMa
         }
     }
 
-    let mut outbounds_vec: Vec<(String, u64, u64, u64, u64)> = outbound_map
+    let mut outbounds_vec: Vec<(&str, u64, u64, u64, u64)> = outbound_map
         .into_iter()
         .map(|(k, (act, up, down, hits))| (k, act, up, down, hits))
         .collect();
@@ -8019,7 +8069,7 @@ async fn build_pure_rust_core_telemetry(state: &Arc<AppState>, core: &Arc<CoreMa
         .take(8)
         .map(|(tag, act, up, down, hits)| {
             let display_name =
-                resolve_telemetry_tag_display_name(&tag, &tag_display_map, &store_snap);
+                resolve_telemetry_tag_display_name(tag, &tag_display_map, &store_snap);
             json!({
                 "tag": tag,
                 "display_name": display_name,
@@ -10972,6 +11022,8 @@ async fn handle_reload_with_disk_sync(state: &Arc<AppState>, core: &Arc<CoreMana
                 "success": true,
                 "reloaded_from_disk": reloaded_from_disk,
                 "config_drift": live.config_drift,
+                "desired_config_digest": live.desired_config_digest,
+                "applied_config_digest": live.applied_config_digest,
             })
         }
         Err(e) => json!({ "success": false, "error": format!("{e:#}") }),
@@ -12050,7 +12102,7 @@ async fn execute_cli_part_dns_fuzzer(
                             let start = std::time::Instant::now();
                             tokio::time::timeout(
                                 Duration::from_millis(800),
-                                tokio::net::TcpStream::connect(&target),
+                                crate::net_stack::connect_tcp_bypass_host(&target),
                             )
                             .await
                             .ok()
@@ -12260,23 +12312,28 @@ async fn execute_cli_part_dns_fuzzer(
                         let mut samples = Vec::with_capacity(doms.len());
                         let mut vals = Vec::with_capacity(doms.len());
                         for dom in &doms {
-                            let res: Result<f64, String> = if proto == "udp" {
-                                probe_udp_dns_rtt_ms(&target, dom).await
+                            let res: Result<f64, Value> = if proto == "udp" {
+                                probe_udp_dns_rtt_ms(&target, dom)
+                                    .await
+                                    .map_err(|err_msg| dns_speed_test_error_json(None, &err_msg))
                             } else {
                                 let t0 = std::time::Instant::now();
                                 let connect_fut = async {
                                     if let Some(sock) = resolved_sock {
-                                        tokio::net::TcpStream::connect(sock).await
+                                        crate::net_stack::connect_tcp_bypass(sock).await
                                     } else {
-                                        tokio::net::TcpStream::connect(&target).await
+                                        crate::net_stack::connect_tcp_bypass_host(&target).await
                                     }
                                 };
                                 match tokio::time::timeout(Duration::from_millis(1500), connect_fut)
                                     .await
                                 {
                                     Ok(Ok(_)) => Ok((t0.elapsed().as_secs_f64() * 1000.0).max(0.5)),
-                                    Ok(Err(e)) => Err(e.to_string()),
-                                    Err(_) => Err("timeout".to_string()),
+                                    Ok(Err(e)) => Err(dns_speed_test_error_json(
+                                        e.raw_os_error(),
+                                        &e.to_string(),
+                                    )),
+                                    Err(_) => Err(dns_speed_test_error_json(None, "timeout")),
                                 }
                             };
                             match res {
@@ -12290,12 +12347,12 @@ async fn execute_cli_part_dns_fuzzer(
                                         "error": null
                                     }));
                                 }
-                                Err(err_msg) => {
+                                Err(err_val) => {
                                     samples.push(json!({
                                         "domain": dom,
                                         "ok": false,
                                         "ms": null,
-                                        "error": err_msg
+                                        "error": err_val
                                     }));
                                 }
                             }
@@ -15626,7 +15683,7 @@ fn service_probe_curl_args(url: &str, socks_proxy: Option<&str>) -> Vec<String> 
     args
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod service_probe_integration_tests {
     use super::{service_http_outcome, service_probe_curl_args};
     use serde_json::Value;
@@ -16721,6 +16778,28 @@ pub fn sync_from_store_to_json_and_cache(store: &crate::store::RouterStoreData) 
     sync_section_cache(store);
 }
 
+fn dns_speed_test_error_json(raw_os_error: Option<i32>, message: &str) -> Value {
+    if message == "timeout" {
+        return json!({
+            "kind": "transport",
+            "code": 28,
+            "message": message
+        });
+    }
+    if message == "invalid DNS response" {
+        return json!({
+            "kind": "dns",
+            "code": 0,
+            "message": message
+        });
+    }
+    json!({
+        "kind": "transport",
+        "code": raw_os_error.unwrap_or(0),
+        "message": message
+    })
+}
+
 async fn probe_udp_dns_rtt_ms(target: &str, domain: &str) -> Result<f64, String> {
     let mut pkt = Vec::with_capacity(64);
     let tx_id: u16 = 0x5441;
@@ -16748,6 +16827,7 @@ async fn probe_udp_dns_rtt_ms(target: &str, domain: &str) -> Result<f64, String>
     let sock = tokio::net::UdpSocket::bind(bind_addr)
         .await
         .map_err(|e| e.to_string())?;
+    let _ = crate::net_stack::set_bypass_fwmark(&sock);
     sock.connect(target).await.map_err(|e| e.to_string())?;
     let t0 = std::time::Instant::now();
     sock.send(&pkt).await.map_err(|e| e.to_string())?;
@@ -17706,6 +17786,43 @@ mod tests {
     }
 
     #[test]
+    fn resolve_latency_targets_handles_single_node_section_without_selector_or_own_balancer() {
+        let mut store = crate::store::RouterStoreData::default();
+        store.outbound_sources.push(crate::store::OutboundSource {
+            id: "src_1cent".to_string(),
+            source_type: "proxy_links".to_string(),
+            proxy_links: vec![
+                "vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443#1cent".to_string(),
+            ],
+            ..Default::default()
+        });
+        store.balancers.push(crate::store::BalancerConfig {
+            id: "akonit_url_test".to_string(),
+            enabled: true,
+            ..Default::default()
+        });
+        store.sections.clear();
+        store.sections.push(crate::store::RoutingSection {
+            id: "Main".to_string(),
+            outbound_source_refs: vec!["src_1cent".to_string()],
+            ..Default::default()
+        });
+
+        let mut proxies = Map::new();
+        proxies.insert(
+            "1cent".to_string(),
+            json!({
+                "type": "Mieru",
+                "name": "1cent"
+            }),
+        );
+
+        let (tags, eff) = resolve_latency_targets(&store, Some(&proxies), "group", "Main", "Main");
+        assert_eq!(eff, "1cent");
+        assert_eq!(tags, vec!["1cent".to_string()]);
+    }
+
+    #[test]
     fn resolve_subscription_cli_target_selects_individual_source() {
         let mut store = crate::store::RouterStoreData::default();
         store.outbound_sources.push(crate::store::OutboundSource {
@@ -18258,6 +18375,21 @@ ipv4 2 udp 17 120 src=192.168.1.50 dst=1.1.1.1 sport=60123 dport=443 packets=3 b
     }
 
     #[test]
+    fn test_dns_speed_test_error_json_matches_frontend_failure_label_schema() {
+        let timeout = dns_speed_test_error_json(None, "timeout");
+        assert_eq!(timeout["kind"], "transport");
+        assert_eq!(timeout["code"], 28);
+
+        let refused = dns_speed_test_error_json(Some(111), "Connection refused (os error 111)");
+        assert_eq!(refused["kind"], "transport");
+        assert_eq!(refused["code"], 111);
+
+        let invalid_dns = dns_speed_test_error_json(None, "invalid DNS response");
+        assert_eq!(invalid_dns["kind"], "dns");
+        assert_eq!(invalid_dns["code"], 0);
+    }
+
+    #[test]
     fn test_format_show_config_value_redacts_and_compacts_cached_nodes() {
         let mut data = crate::store::RouterStoreData::default();
         data.settings.clash_api_secret = "clash-secret-123".into();
@@ -18489,6 +18621,8 @@ ipv4 2 udp 17 120 src=192.168.1.50 dst=1.1.1.1 sport=60123 dport=443 packets=3 b
         ));
         assert!(is_allowed_router_ubus_call("network.interface", "dump"));
         assert!(is_allowed_router_ubus_call("luci-rpc", "getHostHints"));
+        assert!(should_forward_router_ubus_call("luci-rpc", "getHostHints"));
+        assert!(should_forward_router_ubus_call("luci-rpc", "getDHCPLeases"));
     }
 
     #[tokio::test]
@@ -19805,7 +19939,7 @@ tls=TLSv1.3
             make_src("sub_three", false),
         ];
 
-        let (meta1, links1, hidden1) = build_outbound_metadata_and_links(&store, "Main");
+        let (meta1, links1, hidden1) = build_outbound_metadata_and_links(&store, "Main", true);
         let names1 = meta1["names"].as_object().unwrap();
         assert!(names1.contains_key("🇪🇪 Эстония"));
         assert!(names1.contains_key("🇪🇪 Эстония-1"));
@@ -19819,7 +19953,7 @@ tls=TLSv1.3
         assert!(meta1["internal_hidden"].get("Авто").is_none());
 
         store.sections[0].outbound_source_refs.reverse();
-        let (meta2, _, _) = build_outbound_metadata_and_links(&store, "Main");
+        let (meta2, _, _) = build_outbound_metadata_and_links(&store, "Main", false);
         let ee_count = meta2["names"]
             .as_object()
             .unwrap()

@@ -693,7 +693,6 @@ def _target_triple_family(target_triple: str) -> str:
     return family
 
 
-
 def _read_uleb128(data: bytes, offset: int, end: int) -> tuple[int, int]:
     value = 0
     shift = 0
@@ -934,6 +933,7 @@ def validate_binary_arch(
         )
     if expected_family in ("armv6", "armv7"):
         validate_arm_abi(binary, expected_family, order)
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
