@@ -6,6 +6,7 @@ on:
       - main
       - master
       - '2.0'
+      - product
   pull_request:
     branches:
       - main
@@ -121,6 +122,28 @@ jobs:
         run: |
           npm run locales:actualize
           npm run ci
+
+      # Product source qualification generates assets without writing to Git.
+      # The strict committed-assets check below remains mandatory.
+      - name: Capture generated product frontend candidate
+        if: github.event_name == 'push' && github.ref == 'refs/heads/product'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/product-frontend"
+          git diff --binary -- fe-app-tachyon/locales luci-app-tachyon/po luci-app-tachyon/htdocs/luci-static/resources/view/tachyon fe-app-tachyon/src/contracts/generated > "$RUNNER_TEMP/product-frontend/generated.patch"
+          printf '%s\n' "$(git rev-parse HEAD)" > "$RUNNER_TEMP/product-frontend/source-commit.txt"
+          cd "$RUNNER_TEMP/product-frontend"
+          sha256sum generated.patch source-commit.txt > SHA256SUMS
+
+      - name: Upload generated product frontend candidate
+        if: github.event_name == 'push' && github.ref == 'refs/heads/product'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: product-generated-frontend-${{ github.sha }}
+          path: ${{ runner.temp }}/product-frontend
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Ensure generated frontend and locale files are committed
         run: |
