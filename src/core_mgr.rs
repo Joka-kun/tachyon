@@ -5154,7 +5154,7 @@ impl CoreManager {
         if persist_needed {
             if let Err(e) = transaction::commit_transaction_if_current(
                 &self.state,
-                candidate.clone(),
+                candidate,
                 "subscription",
                 expected,
             )
@@ -5168,7 +5168,12 @@ impl CoreManager {
                 return Err(e);
             }
             applied_attempts.extend(mem_updates.iter().map(|(id, ..)| id.clone()));
-            crate::ubus_bridge::sync_from_store_to_json_and_cache(&candidate);
+            // The transaction may normalize the candidate. Publish the actual
+            // committed store, not a pre-transaction clone.
+            {
+                let committed = self.state.data.read().await;
+                crate::ubus_bridge::sync_from_store_to_json_and_cache(&committed);
+            }
             if core_reload_needed && !self.is_manually_stopped() {
                 let _ = self.apply_or_reload().await;
             }
@@ -5193,9 +5198,9 @@ impl CoreManager {
                     applied_attempts.push(id);
                 }
             }
+            self.state.bump_generation();
             crate::ubus_bridge::sync_from_store_to_json_and_cache(&d);
             drop(d);
-            self.state.bump_generation();
         }
         if !applied_attempts.is_empty() {
             let mut attempts = self.sub_last_attempt.lock().await;
