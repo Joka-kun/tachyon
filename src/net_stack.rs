@@ -9612,11 +9612,17 @@ dhcp.cfg01411c.tachyon_prev_server='1.1.1.1 8.8.8.8'
         );
         let mut missing = listing(serde_json::json!(path));
         missing["nftables"].as_array_mut().unwrap().pop();
-        assert_eq!(torrserver_direct_rules_drift(&missing, path, None), Some(true));
+        assert_eq!(
+            torrserver_direct_rules_drift(&missing, path, None),
+            Some(true)
+        );
         let mut duplicate = listing(serde_json::json!(path));
         let extra = duplicate["nftables"][2].clone();
         duplicate["nftables"].as_array_mut().unwrap().push(extra);
-        assert_eq!(torrserver_direct_rules_drift(&duplicate, path, None), Some(true));
+        assert_eq!(
+            torrserver_direct_rules_drift(&duplicate, path, None),
+            Some(true)
+        );
         assert_eq!(
             torrserver_direct_rules_drift(&serde_json::json!({}), path, None),
             None
@@ -9627,10 +9633,17 @@ dhcp.cfg01411c.tachyon_prev_server='1.1.1.1 8.8.8.8'
     fn test_torrserver_direct_secondary_matches_cached_desired_ruleset() {
         let path = "services/torrserver";
         let primary = "comment \"tachyon-torrserver-direct\"";
-        let both = "comment \"tachyon-torrserver-direct\"\ncomment \"tachyon-torrserver-direct-v6\"";
+        let both =
+            "comment \"tachyon-torrserver-direct\"\ncomment \"tachyon-torrserver-direct-v6\"";
         assert_eq!(torrserver_direct_secondary_expected(None), None);
-        assert_eq!(torrserver_direct_secondary_expected(Some("unrelated")), None);
-        assert_eq!(torrserver_direct_secondary_expected(Some(primary)), Some(false));
+        assert_eq!(
+            torrserver_direct_secondary_expected(Some("unrelated")),
+            None
+        );
+        assert_eq!(
+            torrserver_direct_secondary_expected(Some(primary)),
+            Some(false)
+        );
         assert_eq!(torrserver_direct_secondary_expected(Some(both)), Some(true));
 
         let mut listing = serde_json::json!({"nftables": [
