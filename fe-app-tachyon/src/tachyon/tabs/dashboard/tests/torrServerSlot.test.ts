@@ -68,7 +68,9 @@ describe('independent TorrServer dashboard slot', () => {
     expect(inbound).toHaveLength(1);
     expect(inbound[0].attrs.style).toContain('display: none');
     expect(slots).toHaveLength(1);
-    expect(slots[0].attrs.class).toContain('tachyon-dashboard-widget-slot--full');
+    expect(slots[0].attrs.class).toContain(
+      'tachyon-dashboard-widget-slot--full',
+    );
     expect(slots[0].attrs.style).toContain('display:none');
     expect(slots[0].attrs.class).not.toContain(
       'tachyon-dashboard-widget-slot--hidden',
@@ -95,7 +97,9 @@ describe('independent TorrServer dashboard slot', () => {
     expect(inbound).toHaveLength(1);
     expect(inbound[0].attrs.style).not.toContain('display: none');
     expect(slots).toHaveLength(1);
-    expect(slots[0].attrs.class).toContain('tachyon-dashboard-widget-slot--full');
+    expect(slots[0].attrs.class).toContain(
+      'tachyon-dashboard-widget-slot--full',
+    );
     expect(slots[0].attrs['data-widget-id']).toBeUndefined();
     expect(slots[0].attrs.style).toContain('display:none');
     expect(findById(root, 'dashboard-torrserver-grid')).toHaveLength(1);
