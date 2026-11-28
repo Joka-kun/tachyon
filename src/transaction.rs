@@ -676,8 +676,49 @@ pub fn commit_transaction_boxed_in_history_dir<'a>(
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = anyhow::Result<ConfigPlanReport>> + Send + 'a>,
 > {
+    commit_transaction_checked(state, candidate, source, hist_dir, None)
+}
+
+/// Snapshot of the exact store used to construct an optimistic candidate.
+/// The generation catches normal revisions; the serialized state also detects
+/// writers which mutate the store without bumping the generation.
+pub(crate) struct ExpectedStore {
+    generation: u64,
+    data: Value,
+}
+
+impl ExpectedStore {
+    pub(crate) fn capture(state: &AppState, data: &RouterStoreData) -> anyhow::Result<Self> {
+        Ok(Self {
+            generation: state.store_generation(),
+            data: serde_json::to_value(data)?,
+        })
+    }
+
+    fn ensure_current(&self, state: &AppState, data: &RouterStoreData) -> anyhow::Result<()> {
+        if self.generation != state.store_generation() || self.data != serde_json::to_value(data)? {
+            anyhow::bail!("Transaction conflict: store changed while preparing candidate");
+        }
+        Ok(())
+    }
+}
+
+#[inline(never)]
+fn commit_transaction_checked<'a>(
+    state: &'a Arc<AppState>,
+    candidate: Box<RouterStoreData>,
+    source: &'a str,
+    hist_dir: Option<std::path::PathBuf>,
+    expected: Option<ExpectedStore>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = anyhow::Result<ConfigPlanReport>> + Send + 'a>,
+> {
     Box::pin(async move {
         let _commit_guard = commit_lock().lock().await;
+        if let Some(ref expected) = expected {
+            let current = state.data.read().await;
+            expected.ensure_current(state, &current)?;
+        }
 
         // Phase 1: PLAN (deduplicate cloned conditions and enforce cascade invariants)
         // Phase 2: PREFLIGHT & Phase 5: VALIDATE (offloaded so single-thread Tokio runtime stays responsive)
@@ -696,21 +737,20 @@ pub fn commit_transaction_boxed_in_history_dir<'a>(
         .await
         .map_err(|e| anyhow::anyhow!("Transaction compile task failed: {e}"))??;
 
-        // Phase 3: SNAPSHOT (capture current state on heap for instant LIFO rollback)
+        // Phase 3-4: compare the store again after compilation, while holding
+        // the same write guard used for the mutation. A stale candidate must
+        // not create a known-good snapshot or replace the current state.
         let mut previous = {
-            let guard = state.data.read().await;
-            clone_store_boxed(&guard)
-        };
-        if !state.lkg_path.exists() {
-            let _ = promote_to_known_good(&state.lkg_path, &previous);
-        }
-
-        // Phase 4: MUTATE (persist store JSON before writing compiled core config)
-        {
             let mut d = state.data.write().await;
+            if let Some(ref expected) = expected {
+                expected.ensure_current(state, &d)?;
+            }
+            if !state.lkg_path.exists() {
+                let _ = promote_to_known_good(&state.lkg_path, &d);
+            }
             std::mem::swap(&mut *d, &mut *candidate);
-        }
-        drop(candidate);
+            candidate
+        };
 
         if let Err(e) = state.save().await {
             let mut d = state.data.write().await;
@@ -821,6 +861,17 @@ pub async fn commit_transaction_with_source(
     commit_transaction_boxed(state, Box::new(candidate), source).await
 }
 
+/// Commit an optimistic candidate only if its input store is still current.
+/// This protects the pre-swap window, not external runtime API side effects.
+pub(crate) async fn commit_transaction_if_current(
+    state: &Arc<AppState>,
+    candidate: RouterStoreData,
+    source: &str,
+    expected: ExpectedStore,
+) -> anyhow::Result<ConfigPlanReport> {
+    commit_transaction_checked(state, Box::new(candidate), source, None, Some(expected)).await
+}
+
 /// Execute an 8-phase atomic configuration transaction with LIFO rollback on failure.
 pub async fn commit_transaction(
     state: &Arc<AppState>,
@@ -833,6 +884,74 @@ pub async fn commit_transaction(
 mod tests {
     use super::*;
     use crate::store::{InboundServer, OutboundSource};
+
+    #[tokio::test]
+    async fn test_guarded_transaction_rejects_stale_store_without_writing() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "tachyon_tx_stale_{}_{}",
+            std::process::id(),
+            crate::crypto_gen::generate_hex(4)
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("mkdir");
+        let store_path = tmp_dir.join("store.json");
+        let core_path = tmp_dir.join("tachyon-core-config.json");
+        let state = AppState::load_or_create(&store_path).expect("load store");
+        {
+            let mut data = state.data.write().await;
+            data.settings.core_config_path = core_path.to_string_lossy().into_owned();
+        }
+        state.save().await.expect("save fixture");
+        let (expected, mut candidate) = {
+            let data = state.data.read().await;
+            (
+                ExpectedStore::capture(&state, &data).expect("capture"),
+                clone_store_boxed(&data),
+            )
+        };
+        candidate.sections[0].label = "stale candidate".into();
+        let before_store = std::fs::read(&store_path).expect("read store");
+        let before_lkg = std::fs::read(&state.lkg_path).ok();
+        // Direct writer deliberately does not bump generation.
+        {
+            let mut data = state.data.write().await;
+            data.sections[0].label = "concurrent edit".into();
+        }
+        let result =
+            commit_transaction_if_current(&state, *candidate, "subscription", expected).await;
+        assert!(
+            result
+                .expect_err("stale transaction must fail")
+                .to_string()
+                .contains("Transaction conflict")
+        );
+        assert_eq!(
+            state.data.read().await.sections[0].label,
+            "concurrent edit"
+        );
+        assert_eq!(std::fs::read(&store_path).unwrap(), before_store);
+        assert_eq!(std::fs::read(&state.lkg_path).ok(), before_lkg);
+        assert!(!core_path.exists());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_expected_store_rejects_revision_even_if_content_returns() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "tachyon_tx_revision_{}_{}",
+            std::process::id(),
+            crate::crypto_gen::generate_hex(4)
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("mkdir");
+        let state = AppState::load_or_create(&tmp_dir.join("store.json")).expect("load store");
+        {
+            let data = state.data.read().await;
+            let expected = ExpectedStore::capture(&state, &data).expect("capture");
+            assert!(expected.ensure_current(&state, &data).is_ok());
+            state.bump_generation();
+            assert!(expected.ensure_current(&state, &data).is_err());
+        }
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
 
     #[test]
     fn test_section_disable_cascades_to_bound_server() {
