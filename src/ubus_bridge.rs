@@ -15353,6 +15353,325 @@ fn build_service_health_targets(
     targets
 }
 
+/// Classify the completed HTTPS probe shown in the service availability modal.
+fn service_http_outcome(http_code: u16, exit_code: i32) -> (bool, String) {
+    if exit_code == 0 && (200..300).contains(&http_code) {
+        return (true, format!("OK {http_code}"));
+    }
+    let reason = match exit_code {
+        6 => "DNS Error",
+        7 => "TCP Refused",
+        28 => "Timeout",
+        35 => "TLS Handshake Error",
+        51 | 58 | 60 => "TLS Certificate Error",
+        52 | 55 | 56 => "Conn Reset",
+        0 if http_code != 0 => return (false, format!("HTTP {http_code}")),
+        0 => "No HTTP response",
+        _ => "HTTP probe failed",
+    };
+    (false, reason.to_string())
+}
+
+#[cfg(test)]
+mod service_http_outcome_tests {
+    use super::service_http_outcome;
+
+    #[test]
+    fn complete_successful_http_response_is_reachable() {
+        for code in [200, 204, 206, 299] {
+            assert_eq!(service_http_outcome(code, 0), (true, format!("OK {code}")));
+        }
+    }
+
+    #[test]
+    fn redirects_denials_rate_limits_and_server_errors_are_not_success() {
+        for code in [0, 301, 302, 401, 403, 404, 429, 451, 500, 503] {
+            assert!(!service_http_outcome(code, 0).0, "{code}");
+        }
+    }
+
+    #[test]
+    fn direct_probe_forces_direct_transport_and_secure_https() {
+        let args = super::service_probe_curl_args("https://example.com/", None);
+        assert_eq!(args.first().map(String::as_str), Some("-q"));
+        assert!(!args.iter().any(|arg| arg == "-k" || arg == "--insecure"));
+        let option = |name: &str| {
+            let index = args
+                .iter()
+                .position(|arg| arg == name)
+                .expect("option exists");
+            args.get(index + 1)
+                .map(String::as_str)
+                .expect("option value exists")
+        };
+        assert_eq!(option("--proto"), "=https");
+        assert_eq!(option("--proto-redir"), "=https");
+        assert_eq!(option("--noproxy"), "*");
+        assert!(!args.iter().any(|arg| arg == "-x"));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("https://example.com/")
+        );
+    }
+
+    #[test]
+    fn socks_probe_forces_the_selected_proxy_without_environment_bypass() {
+        let proxy = "socks5h://127.0.0.1:1080";
+        let args = super::service_probe_curl_args("https://example.com/", Some(proxy));
+        let no_proxy = args
+            .iter()
+            .position(|arg| arg == "--noproxy")
+            .expect("noproxy exists");
+        assert_eq!(args.get(no_proxy + 1).map(String::as_str), Some(""));
+        let proxy_option = args
+            .iter()
+            .position(|arg| arg == "-x")
+            .expect("proxy exists");
+        assert_eq!(args.get(proxy_option + 1).map(String::as_str), Some(proxy));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("https://example.com/")
+        );
+    }
+
+    #[test]
+    fn failed_curl_cannot_become_success_from_partial_http_status() {
+        for code in [6, 7, 18, 28, 35, 51, 58, 60, 63] {
+            assert!(!service_http_outcome(200, code).0, "{code}");
+        }
+    }
+}
+
+fn service_probe_curl_args(url: &str, socks_proxy: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "-q".to_string(), // Ignore ~/.curlrc; diagnostic transport must be explicit.
+        "-4".to_string(),
+        "-sS".to_string(),
+        "--proto".to_string(),
+        "=https".to_string(),
+        "--proto-redir".to_string(),
+        "=https".to_string(),
+        "-L".to_string(),
+        "--max-redirs".to_string(),
+        "2".to_string(),
+        "--connect-timeout".to_string(),
+        "6".to_string(),
+        "--max-time".to_string(),
+        "10".to_string(),
+        "-A".to_string(),
+        "Mozilla/5.0 (X11; Linux aarch64) TachyonProbe/2.0".to_string(),
+        "-r".to_string(),
+        "0-4095".to_string(),
+        "-o".to_string(),
+        "/dev/null".to_string(),
+        "-w".to_string(),
+        "%{http_code}|%{remote_ip}|%{time_namelookup}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}".to_string(),
+    ];
+
+    // An empty --noproxy list forces the selected proxy for every host.
+    // For a direct probe, "*" prevents inherited proxy environment variables.
+    args.push("--noproxy".to_string());
+    args.push(if socks_proxy.is_some() {
+        String::new()
+    } else {
+        "*".to_string()
+    });
+    if let Some(proxy) = socks_proxy {
+        args.push("-x".to_string());
+        args.push(proxy.to_string());
+    }
+    args.push(url.to_string());
+    args
+}
+
+#[cfg(test)]
+mod service_probe_integration_tests {
+    use super::{service_http_outcome, service_probe_curl_args};
+    use serde_json::Value;
+    use std::io::{BufRead, BufReader};
+    use std::path::PathBuf;
+    use std::process::{Child, Command, Output, Stdio};
+
+    struct Fixture {
+        child: Child,
+        tls_port: u16,
+        socks_port: u16,
+        cert_path: PathBuf,
+        hits_path: PathBuf,
+    }
+
+    impl Fixture {
+        fn start() -> Self {
+            let fixture_script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/service_probe_tls_socks.py");
+            let mut child = Command::new("python3")
+                .arg(fixture_script)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("python3 and the local HTTPS/SOCKS fixture must be available");
+            let stdout = child.stdout.take().expect("fixture stdout is piped");
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .expect("fixture must publish its ports");
+            let metadata: Value =
+                serde_json::from_str(&line).expect("fixture must publish valid JSON");
+            Self {
+                child,
+                tls_port: metadata["tls_port"].as_u64().unwrap() as u16,
+                socks_port: metadata["socks_port"].as_u64().unwrap() as u16,
+                cert_path: PathBuf::from(metadata["cert_path"].as_str().unwrap()),
+                hits_path: PathBuf::from(metadata["hits_path"].as_str().unwrap()),
+            }
+        }
+
+        fn curl(&self, path: &str, proxy: Option<&str>, trust_certificate: bool) -> Output {
+            let url = format!("https://localhost:{}{}", self.tls_port, path);
+            let args = service_probe_curl_args(&url, proxy);
+            let mut command = Command::new("curl");
+            command
+                .args(&args)
+                .env("HTTPS_PROXY", "http://127.0.0.1:1")
+                .env("https_proxy", "http://127.0.0.1:1")
+                .env("ALL_PROXY", "http://127.0.0.1:1")
+                .env("all_proxy", "http://127.0.0.1:1")
+                .env("NO_PROXY", "localhost")
+                .env("no_proxy", "localhost")
+                .env_remove("CURL_CA_BUNDLE")
+                .env_remove("SSL_CERT_FILE")
+                .env_remove("SSL_CERT_DIR");
+            if trust_certificate {
+                command.env("CURL_CA_BUNDLE", &self.cert_path);
+            }
+            command
+                .output()
+                .expect("curl must be installed for integration tests")
+        }
+
+        fn outcome(output: &Output) -> (u16, bool, String) {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let http_code = stdout
+                .trim()
+                .split('|')
+                .next()
+                .and_then(|value| value.parse::<u16>().ok())
+                .unwrap_or(0);
+            let exit_code = output.status.code().unwrap_or(-1);
+            let (success, reason) = service_http_outcome(http_code, exit_code);
+            (http_code, success, reason)
+        }
+
+        fn socks_hits(&self) -> usize {
+            std::fs::read(&self.hits_path)
+                .map(|data| data.len())
+                .unwrap_or(0)
+        }
+
+        fn socks_url(&self) -> String {
+            format!("socks5h://127.0.0.1:{}", self.socks_port)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[test]
+    fn direct_https_probe_accepts_a_trusted_completed_2xx_response() {
+        let fixture = Fixture::start();
+        let output = fixture.curl("/ok", None, true);
+        let (code, success, reason) = Fixture::outcome(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(code, 200);
+        assert!(success, "{reason}");
+    }
+
+    #[test]
+    fn invalid_tls_certificate_is_not_reachable() {
+        let fixture = Fixture::start();
+        let output = fixture.curl("/ok", None, false);
+        let (_, success, _) = Fixture::outcome(&output);
+        assert!(!success, "an untrusted local certificate must not pass");
+        assert_ne!(output.status.code(), Some(0));
+    }
+
+    #[test]
+    fn http_denials_and_rate_limits_are_not_reachable() {
+        let fixture = Fixture::start();
+        for (path, expected) in [("/forbidden", 403), ("/rate-limit", 429)] {
+            let output = fixture.curl(path, None, true);
+            let (code, success, _) = Fixture::outcome(&output);
+            assert_eq!(output.status.code(), Some(0));
+            assert_eq!(code, expected);
+            assert!(!success, "{path} must not be classified as reachable");
+        }
+    }
+
+    #[test]
+    fn redirect_from_https_to_http_is_rejected() {
+        let fixture = Fixture::start();
+        let output = fixture.curl("/redirect-http", None, true);
+        let (_, success, _) = Fixture::outcome(&output);
+        assert!(!success, "HTTP downgrade redirect must not pass");
+        assert_ne!(output.status.code(), Some(0));
+    }
+
+    #[test]
+    fn truncated_http_body_is_not_reachable_even_after_200_headers() {
+        let fixture = Fixture::start();
+        let output = fixture.curl("/truncated", None, true);
+        let (code, success, _) = Fixture::outcome(&output);
+        assert_eq!(code, 200);
+        assert_ne!(output.status.code(), Some(0));
+        assert!(
+            !success,
+            "curl's incomplete-transfer exit code must be honored"
+        );
+    }
+
+    #[test]
+    fn socks5h_is_used_even_when_no_proxy_environment_matches() {
+        let fixture = Fixture::start();
+        let proxy = fixture.socks_url();
+        let output = fixture.curl("/ok", Some(&proxy), true);
+        let (code, success, reason) = Fixture::outcome(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(code, 200);
+        assert!(success, "{reason}");
+        assert!(
+            fixture.socks_hits() > 0,
+            "the local SOCKS5 proxy must receive the request"
+        );
+    }
+
+    #[test]
+    fn unavailable_socks_proxy_does_not_fall_back_to_direct_path() {
+        let fixture = Fixture::start();
+        let output = fixture.curl("/ok", Some("socks5h://127.0.0.1:1"), true);
+        let (_, success, _) = Fixture::outcome(&output);
+        assert!(
+            !success,
+            "NO_PROXY must not bypass the selected SOCKS proxy"
+        );
+        assert_ne!(output.status.code(), Some(0));
+    }
+}
+
 async fn probe_service_target(
     section: String,
     route_type: String,
@@ -15383,32 +15702,8 @@ async fn probe_service_target(
     };
     let url = format!("https://{clean_domain}{path}");
 
+    let args = service_probe_curl_args(&url, socks_proxy.as_deref());
     let mut curl_cmd = Command::new("curl");
-    let mut args = vec![
-        "-4".to_string(),
-        "-sS".to_string(),
-        "-k".to_string(),
-        "-L".to_string(),
-        "--max-redirs".to_string(),
-        "2".to_string(),
-        "--connect-timeout".to_string(),
-        "6".to_string(),
-        "--max-time".to_string(),
-        "10".to_string(),
-        "-A".to_string(),
-        "Mozilla/5.0 (X11; Linux aarch64) TachyonProbe/2.0".to_string(),
-        "-r".to_string(),
-        "0-4095".to_string(),
-        "-o".to_string(),
-        "/dev/null".to_string(),
-        "-w".to_string(),
-        "%{http_code}|%{remote_ip}|%{time_namelookup}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}".to_string(),
-    ];
-    if let Some(ref proxy) = socks_proxy {
-        args.push("-x".to_string());
-        args.push(proxy.clone());
-    }
-    args.push(url.clone());
 
     let mut last_out = None;
     for attempt in 0..2u8 {
@@ -15449,11 +15744,11 @@ async fn probe_service_target(
                 .first()
                 .and_then(|s| s.trim().parse().ok())
                 .unwrap_or(0);
-            let mut remote_ip = parts
+            let remote_ip = parts
                 .get(1)
-                .map(|s| s.trim().to_string())
+                .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
-                .unwrap_or_default();
+                .unwrap_or("-");
             let t_dns: f64 = parts
                 .get(2)
                 .and_then(|s| s.trim().replace(',', ".").parse().ok())
@@ -15470,20 +15765,6 @@ async fn probe_service_target(
                 .get(5)
                 .and_then(|s| s.trim().replace(',', ".").parse().ok())
                 .unwrap_or(0.0);
-
-            if remote_ip.is_empty() {
-                if let Ok(Ok(mut it)) = tokio::time::timeout(
-                    Duration::from_millis(800),
-                    tokio::net::lookup_host((clean_domain.as_str(), 443)),
-                )
-                .await
-                    && let Some(addr) = it.next()
-                {
-                    remote_ip = addr.ip().to_string();
-                } else {
-                    remote_ip = "-".to_string();
-                }
-            }
 
             let dns_ms = if t_dns > 0.0 {
                 (t_dns * 1000.0).round().max(1.0) as u64
@@ -15507,21 +15788,7 @@ async fn probe_service_target(
             };
 
             let exit_code = out.status.code().unwrap_or(-1);
-            let (success, status_class) = if (200..500).contains(&http_code) && http_code != 451 {
-                (true, format!("OK {http_code}"))
-            } else if http_code > 0 {
-                (false, format!("HTTP {http_code}"))
-            } else {
-                let reason = match exit_code {
-                    6 => "DNS Error",
-                    7 => "TCP Refused",
-                    28 => "Timeout",
-                    35 | 51 | 58 | 60 => "TLS Reset",
-                    52 | 55 | 56 => "Conn Reset",
-                    _ => "Unreachable",
-                };
-                (false, reason.to_string())
-            };
+            let (success, status_class) = service_http_outcome(http_code, exit_code);
 
             json!({
                 "section": section,
@@ -15536,8 +15803,20 @@ async fn probe_service_target(
                 "success": success,
             })
         }
+        Ok(Err(_)) if socks_proxy.is_some() => json!({
+            "section": section,
+            "route_type": route_type,
+            "domain": clean_domain,
+            "ip": "-",
+            "dns_ms": 0,
+            "tcp_ms": 0,
+            "tls_ms": 0,
+            "http_ms": 0,
+            "status_class": "Proxy probe unavailable",
+            "success": false,
+        }),
         Ok(Err(_)) => {
-            // Fallback when `curl` binary is unavailable (e.g. host unit test environment)
+            // TCP evidence alone does not establish HTTP availability.
             let dns_start = std::time::Instant::now();
             let addrs = tokio::time::timeout(
                 Duration::from_secs(2),
@@ -15579,9 +15858,9 @@ async fn probe_service_target(
                 "dns_ms": dns_ms,
                 "tcp_ms": tcp_ms,
                 "tls_ms": 0,
-                "http_ms": tcp_ms,
-                "status_class": if reachable { "TCP OK" } else { "Unreachable" },
-                "success": reachable,
+                "http_ms": 0,
+                "status_class": if reachable { "TCP only (HTTP unverified)" } else { "Unreachable" },
+                "success": false,
             })
         }
         Err(_) => json!({
