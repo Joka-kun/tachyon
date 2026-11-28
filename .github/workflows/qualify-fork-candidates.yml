@@ -24,11 +24,11 @@ jobs:
       matrix:
         include:
           - candidate: pr20
-            sha: e307ced3f2d49d8f8e3e49d917da3d47f32a8da4
+            sha: 78dfb2cdb177112821d706bdc80d890a0f366fc4
           - candidate: pr21
-            sha: 3438c5dc1494d36c0f960034805847c27af1f863
+            sha: f6df119aca992b1f1ed9c59efb877e8990411594
           - candidate: pr22
-            sha: e2714067c89911b57f1da3533fb2a0e3ecc5acbb
+            sha: bf472da01ebf8141f41d0de2f554f1eddee552a5
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -107,11 +107,11 @@ jobs:
       matrix:
         include:
           - candidate: pr20
-            sha: e307ced3f2d49d8f8e3e49d917da3d47f32a8da4
+            sha: 78dfb2cdb177112821d706bdc80d890a0f366fc4
           - candidate: pr21
-            sha: 3438c5dc1494d36c0f960034805847c27af1f863
+            sha: f6df119aca992b1f1ed9c59efb877e8990411594
           - candidate: pr22
-            sha: e2714067c89911b57f1da3533fb2a0e3ecc5acbb
+            sha: bf472da01ebf8141f41d0de2f554f1eddee552a5
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -164,11 +164,11 @@ jobs:
       matrix:
         include:
           - candidate: pr20
-            sha: e307ced3f2d49d8f8e3e49d917da3d47f32a8da4
+            sha: 78dfb2cdb177112821d706bdc80d890a0f366fc4
           - candidate: pr21
-            sha: 3438c5dc1494d36c0f960034805847c27af1f863
+            sha: f6df119aca992b1f1ed9c59efb877e8990411594
           - candidate: pr22
-            sha: e2714067c89911b57f1da3533fb2a0e3ecc5acbb
+            sha: bf472da01ebf8141f41d0de2f554f1eddee552a5
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -223,7 +223,7 @@ jobs:
           import json, os, subprocess
           from pathlib import Path
           jobs = json.loads((Path(os.environ["RUNNER_TEMP"]) / "qualification-jobs.json").read_text())["jobs"]
-          targets = {"pr20":"e307ced3f2d49d8f8e3e49d917da3d47f32a8da4","pr21":"3438c5dc1494d36c0f960034805847c27af1f863","pr22":"e2714067c89911b57f1da3533fb2a0e3ecc5acbb"}
+          targets = {"pr20":"78dfb2cdb177112821d706bdc80d890a0f366fc4","pr21":"f6df119aca992b1f1ed9c59efb877e8990411594","pr22":"bf472da01ebf8141f41d0de2f554f1eddee552a5"}
           repo = os.environ["GITHUB_REPOSITORY"]
           url = f'https://github.com/{repo}/actions/runs/{os.environ["GITHUB_RUN_ID"]}'
           rows = []
@@ -236,7 +236,7 @@ jobs:
                   state = "success" if result == "success" else "failure" if result == "failure" else "error"
                   failed |= state != "success"
                   subprocess.run(["gh", "api", "--method", "POST", f"repos/{repo}/statuses/{sha}",
-                                  "-f", f"state={state}", "-f", f"context=qualification/v581/{kind}",
+                                  "-f", f"state={state}", "-f", f"context=qualification/v582/{kind}",
                                   "-f", f"description=GitHub-hosted job: {result or 'unconfirmed'}",
                                   "-f", f"target_url={url}"], check=True, stdout=subprocess.DEVNULL)
                   rows.append(f"| {label} | {sha} | {kind} | {result or 'unconfirmed'} |")
