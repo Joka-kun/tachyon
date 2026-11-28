@@ -272,13 +272,34 @@ class OpenWrtPackageTest(unittest.TestCase):
 
             good = run("vendor-profile", "aarch64-unknown-linux-musl")
             self.assertEqual(good.returncode, 0, good.stderr)
+            expected_keep = (
+                b"/etc/tachyon/\n"
+                b"/etc/tachyon-core/\n"
+                b"/usr/bin/tachyon-core\n"
+                b"/opt/torrserver/\n"
+                b"/opt/torrserver-silo/\n"
+            )
+
+            def assert_payload(archive, prefix):
+                self.assertEqual(archive.extractfile(prefix + "usr/bin/tachyon").read(), payload)
+                keep = archive.getmember(prefix + "lib/upgrade/keep.d/tachyon")
+                self.assertTrue(keep.isfile())
+                self.assertEqual(keep.mode & 0o777, 0o644)
+                self.assertEqual(archive.extractfile(keep).read(), expected_keep)
+                # Preservation is declarative: no optional service or data
+                # directory is installed merely by listing these paths.
+                self.assertFalse(any(
+                    "torrserver" in member.name.lower()
+                    for member in archive.getmembers()
+                ))
+
             with tarfile.open(ipk, "r:gz") as outer:
                 data = outer.extractfile("./data.tar.gz").read()
             with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
-                self.assertEqual(archive.extractfile("./usr/bin/tachyon").read(), payload)
+                assert_payload(archive, "./")
             with tarfile.open(fileobj=io.BytesIO(gzip.decompress(apk.read_bytes())),
                               mode="r:", ignore_zeros=True) as archive:
-                self.assertEqual(archive.extractfile("usr/bin/tachyon").read(), payload)
+                assert_payload(archive, "")
 
 
 if __name__ == "__main__":

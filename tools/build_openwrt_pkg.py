@@ -15,7 +15,14 @@ import tarfile
 import time
 
 
-SYSUPGRADE_KEEP_FILE = "/etc/tachyon/\n/etc/tachyon-core/\n/usr/bin/tachyon-core\n"
+# Optional TorrServer state survives sysupgrade without installing the service.
+SYSUPGRADE_KEEP_FILE = (
+    "/etc/tachyon/\n"
+    "/etc/tachyon-core/\n"
+    "/usr/bin/tachyon-core\n"
+    "/opt/torrserver/\n"
+    "/opt/torrserver-silo/\n"
+)
 
 PREINST_SCRIPT = """#!/bin/sh
 [ -n "${IPKG_INSTROOT}" ] && exit 0
