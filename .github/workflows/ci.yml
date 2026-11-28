@@ -188,3 +188,77 @@ jobs:
           python3 -m py_compile tools/build_openwrt_pkg.py tools/build_entware_pkg.py
           python3 tools/test_entware_pkg.py
           python3 tools/test_openwrt_pkg.py
+
+  product_arm64:
+    name: Exact product ARM64 package candidate
+    needs: [rust, frontend, shellcheck]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/qualification/product-upstream-')
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact qualified source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify source identity and native architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(uname -m)" = aarch64
+          git diff --exit-code
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Build package using existing packager
+        env:
+          TACHYON_TARGETS: "aarch64-unknown-linux-musl:aarch64"
+          TACHYON_BUILD_STD: "0"
+          TACHYON_CARGO_EXTRA_ARGS: "--locked"
+          TACHYON_BUILD_COMMIT: ${{ github.sha }}
+          SKIP_FE_BUILD: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash ./build.sh 2.0.0-ci "$RUNNER_TEMP/product-arm64-build"
+          git diff --exit-code
+          cd "$RUNNER_TEMP/product-arm64-build"
+          sha256sum -c SHA256SUMS
+
+      - name: Bind exact package and ELF evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/product-arm64-candidate"
+          mkdir -p "$out"
+          bin=target/aarch64-unknown-linux-musl/release/tachyon
+          LC_ALL=C readelf -h "$bin" > "$out/elf.txt"
+          grep -Eq 'Machine:.*AArch64' "$out/elf.txt"
+          LC_ALL=C readelf -l "$bin" > "$out/program-headers.txt"
+          if grep -q INTERP "$out/program-headers.txt"; then
+            echo DYNAMIC_BINARY_HOLD
+            exit 1
+          fi
+          cp "$RUNNER_TEMP/product-arm64-build/tachyon-aarch64-v2.0.0-ci.apk" "$out/"
+          cp "$RUNNER_TEMP/product-arm64-build/tachyon-aarch64-v2.0.0-ci.ipk" "$out/"
+          printf 'status=CANDIDATE_NOT_DEPLOYABLE\nsource_commit=%s\narchitecture=aarch64-musl\n' "$(git rev-parse HEAD)" > "$out/build-info.txt"
+          printf 'lock_sha256=%s\nbinary_sha256=%s\n' "$(sha256sum Cargo.lock | cut -d' ' -f1)" "$(sha256sum "$bin" | cut -d' ' -f1)" >> "$out/build-info.txt"
+          rustc -Vv > "$out/toolchain.txt"
+          cd "$out"
+          sha256sum tachyon-*.apk tachyon-*.ipk build-info.txt elf.txt program-headers.txt toolchain.txt > SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+      - name: Upload non-deployable package candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: product-openwrt-aarch64-${{ github.sha }}
+          path: ${{ runner.temp }}/product-arm64-candidate
+          if-no-files-found: error
+          retention-days: 14
