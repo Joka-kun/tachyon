@@ -10,7 +10,7 @@ vi.mock('../dashboardLayout', () => ({
 
 vi.mock('../partials', () => ({
   renderSections: () => [],
-  renderWidget: () => [],
+  renderWidget: () => ({ attrs: {}, children: [] }),
 }));
 
 interface TestNode {
@@ -70,7 +70,9 @@ describe('independent TorrServer dashboard slot', () => {
     expect(slots).toHaveLength(1);
     expect(slots[0].attrs.class).toContain('tachyon-dashboard-widget-slot--full');
     expect(slots[0].attrs.style).toContain('display:none');
-    expect(slots[0].attrs.class).not.toContain('tachyon-dashboard-widget-slot--hidden');
+    expect(slots[0].attrs.class).not.toContain(
+      'tachyon-dashboard-widget-slot--hidden',
+    );
     expect(slots[0].attrs['data-widget-id']).toBeUndefined();
     const grids = findById(slots[0], 'dashboard-torrserver-grid');
     expect(grids).toHaveLength(1);
